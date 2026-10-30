@@ -353,7 +353,8 @@ namespace SideDrawer
 
             c.Folders.Add(tools);
 
-            string[] want = new string[] { "DeepSeek", "QQ", "clash", "MuMu", "FL studio", "Magpie", "LetsGal", "Server of dream" };
+            // 默认置顶几个常见软件（找不到就按字母序补满）
+            string[] want = new string[] { "QQ", "WeChat", "微信", "Steam", "Edge", "Chrome", "Telegram", "Discord" };
             foreach (string w in want)
                 foreach (string l in lnks)
                     if (IOPath.GetFileName(l).IndexOf(w, StringComparison.OrdinalIgnoreCase) >= 0 && c.Pins.Count < 8 && !HasPin(c, l))
