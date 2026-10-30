@@ -92,6 +92,9 @@ namespace SideDrawer
         public int ClockColor = 0;   // 0=黑色 1=白色
         public bool RainEffect = false;
         public bool HideTagged = true;
+        public bool CloseOnOutside = false;   // 点击面板外收回（默认关，保持原行为）
+        public int GpuMode = 0;               // 0=自动 1=双卡 2=单卡
+        public bool RetractDark = false;      // 收起按钮：false=浅色 true=深色
         public List<GroupDef> Groups = new List<GroupDef>();
         public List<ItemCfg> Pins = new List<ItemCfg>();
         public List<ItemCfg> Dock = new List<ItemCfg>();
@@ -193,6 +196,9 @@ namespace SideDrawer
             if (d.ContainsKey("clockColor")) c.ClockColor = Convert.ToInt32(d["clockColor"]);
                         if (d.ContainsKey("rainEffect")) c.RainEffect = Convert.ToBoolean(d["rainEffect"]);
                         if (d.ContainsKey("hideTagged")) c.HideTagged = Convert.ToBoolean(d["hideTagged"]);
+            if (d.ContainsKey("closeOnOutside")) c.CloseOnOutside = Convert.ToBoolean(d["closeOnOutside"]);
+            if (d.ContainsKey("gpuMode")) c.GpuMode = Convert.ToInt32(d["gpuMode"]);
+            if (d.ContainsKey("retractDark")) c.RetractDark = Convert.ToBoolean(d["retractDark"]);
                         if (d.ContainsKey("pins"))
                             foreach (object o in (System.Collections.IEnumerable)d["pins"])
                             {
@@ -399,6 +405,9 @@ namespace SideDrawer
         d["clockColor"] = c.ClockColor;
                 d["rainEffect"] = c.RainEffect;
                 d["hideTagged"] = c.HideTagged;
+                d["closeOnOutside"] = c.CloseOnOutside;
+                d["gpuMode"] = c.GpuMode;
+                d["retractDark"] = c.RetractDark;
                 List<object> pins = new List<object>();
                 foreach (ItemCfg i in c.Pins) pins.Add(ItemToJson(i));
                 d["pins"] = pins;
@@ -766,6 +775,7 @@ namespace SideDrawer
         private Border _glass;
         private Grid _overlay;
         private Border _nub;
+        private Rectangle _clickCatcher;   // 面板外点击捕获层
         private Rectangle _veil;
         private Rectangle _tintRect;
         private Rectangle _glowRect;
@@ -971,6 +981,17 @@ namespace SideDrawer
         {
             _root = new Grid();
             _root.Background = Brushes.Transparent;
+
+            // 「点击面板外收回」用的透明捕获层（alpha=1，肉眼不可见但能接收点击）
+            _clickCatcher = new Rectangle();
+            _clickCatcher.Fill = new SolidColorBrush(Color.FromArgb(1, 0, 0, 0));
+                UpdateClickCatcher();
+            _clickCatcher.MouseLeftButtonUp += delegate
+            {
+                if (_menuOpen) { ClosePanelMenu(); return; }   // 菜单开着：点外面先关菜单
+                if (_open && _cfg.CloseOnOutside) CloseDrawer();
+            };
+            _root.Children.Add(_clickCatcher);
             Content = _root;
 
             _nub = BuildNub();
@@ -1083,42 +1104,6 @@ namespace SideDrawer
             noise.Fill = nb;
 
 
-
-
-            Grid sweepHost = new Grid();
-            sweepHost.ClipToBounds = true;
-            Rectangle sweep = new Rectangle();
-            sweep.Width = 2400;
-            sweep.Height = 6000;
-            sweep.RenderTransform = new RotateTransform(-18);
-            LinearGradientBrush sg = new LinearGradientBrush();
-            sg.StartPoint = new Point(0, 0);
-            sg.EndPoint = new Point(1, 0);
-            sg.GradientStops.Add(Stop(Color.FromArgb(0, 255, 255, 255), 0));
-            sg.GradientStops.Add(Stop(Color.FromArgb(0, 255, 255, 255), 0.4));
-            sg.GradientStops.Add(Stop(Color.FromArgb(16, 255, 255, 255), 0.48));
-            sg.GradientStops.Add(Stop(Color.FromArgb(26, 255, 255, 255), 0.5));
-            sg.GradientStops.Add(Stop(Color.FromArgb(16, 255, 255, 255), 0.52));
-            sg.GradientStops.Add(Stop(Color.FromArgb(0, 255, 255, 255), 0.6));
-            sg.GradientStops.Add(Stop(Color.FromArgb(0, 255, 255, 255), 1));
-            sweep.Fill = sg;
-            sweep.HorizontalAlignment = HorizontalAlignment.Left;
-            sweep.VerticalAlignment = VerticalAlignment.Center;
-            TranslateTransform st = new TranslateTransform(-1100, 0);
-            Grid holder = new Grid();
-            holder.RenderTransform = st;
-            holder.Children.Add(sweep);
-            sweepHost.Children.Add(holder);
-            // 扫光已停用：它每 9 秒在面板上扫过一条白色高光，会让颜色忽明忽暗
-            if (Environment.GetEnvironmentVariable("SIDEDRAWER_SWEEP") == "1") _overlay.Children.Add(sweepHost);
-
-            DoubleAnimation anim = new DoubleAnimation(-1100, _panelW + 500, TimeSpan.FromSeconds(9));
-            anim.RepeatBehavior = RepeatBehavior.Forever;
-            anim.BeginTime = TimeSpan.FromSeconds(3);
-            SineEase ease = new SineEase();
-            ease.EasingMode = EasingMode.EaseInOut;
-            anim.EasingFunction = ease;
-            if (Environment.GetEnvironmentVariable("SIDEDRAWER_SWEEP") == "1") st.BeginAnimation(TranslateTransform.XProperty, anim);
 
 
 
@@ -1256,8 +1241,7 @@ namespace SideDrawer
             lqSpec.GradientStops.Add(new GradientStop(Color.FromArgb(8, 255, 255, 255), 0.28));
             lqSpec.GradientStops.Add(new GradientStop(Color.FromArgb(0, 255, 255, 255), 0.5));
             lqSpec.GradientStops.Add(new GradientStop(Color.FromArgb(16, 255, 255, 255), 0.78));
-            lqSpec.GradientStops.Add(new GradientStop(Color.FromArgb(2, 255, 255, 255), 1));
-            spec.Fill = sg;
+            spec.Fill = lqSpec;
             spec.IsHitTestVisible = false;
             liquid.Children.Add(spec);
 
@@ -1971,6 +1955,20 @@ namespace SideDrawer
 
             return sp;
         }
+        /// <summary>按配置重建收起把手（切换深浅色后立刻生效）。</summary>
+        private void RebuildEnvelope()
+        {
+            try
+            {
+                if (_envelope != null) { _panelHost.Children.Remove(_envelope); _envelope = null; }
+                _envelope = BuildEnvelopeHandle();
+                _envelope.HorizontalAlignment = HorizontalAlignment.Left;
+                _envelope.VerticalAlignment = VerticalAlignment.Center;
+                _envelope.Margin = new Thickness(_panelW - 8, 0, 0, 0);
+                _panelHost.Children.Add(_envelope);
+            }
+            catch (Exception ex) { Program.Log("envelope rebuild failed: " + ex.Message); }
+        }
         private Grid BuildEnvelopeHandle()
         {
             Grid g = new Grid();
@@ -1983,13 +1981,22 @@ namespace SideDrawer
             body.CornerRadius = new CornerRadius(23);
             LinearGradientBrush bg = new LinearGradientBrush();
             bg.StartPoint = new Point(0, 0);
-            bg.EndPoint = new Point(1, 0);
-            bg.GradientStops.Add(new GradientStop(Color.FromArgb(72, 255, 255, 255), 0));
-            bg.GradientStops.Add(new GradientStop(Color.FromArgb(132, 255, 255, 255), 0.55));
-            bg.GradientStops.Add(new GradientStop(Color.FromArgb(84, 255, 255, 255), 1));
+            if (_cfg.RetractDark)
+            {
+                bg.GradientStops.Add(new GradientStop(Color.FromArgb(150, 12, 14, 22), 0));
+                bg.GradientStops.Add(new GradientStop(Color.FromArgb(196, 20, 22, 34), 0.55));
+                bg.GradientStops.Add(new GradientStop(Color.FromArgb(160, 14, 16, 26), 1));
+                body.BorderBrush = new SolidColorBrush(Color.FromArgb(175, 255, 255, 255));
+            }
+            else
+            {
+                bg.GradientStops.Add(new GradientStop(Color.FromArgb(72, 255, 255, 255), 0));
+                bg.GradientStops.Add(new GradientStop(Color.FromArgb(132, 255, 255, 255), 0.55));
+                bg.GradientStops.Add(new GradientStop(Color.FromArgb(84, 255, 255, 255), 1));
+                body.BorderBrush = new SolidColorBrush(Color.FromArgb(105, 255, 255, 255));
+            }
             body.Background = bg;
             body.BorderThickness = new Thickness(1);
-            body.BorderBrush = new SolidColorBrush(Color.FromArgb(105, 255, 255, 255));
             g.Children.Add(body);
 
             TextBlock chev = new TextBlock();
@@ -2457,17 +2464,15 @@ namespace SideDrawer
                 }
             }
             catch { }
-
             try
             {
                 if (_gpuPct != null)
                 {
-                if (_gpuPct != null)
-                {
                     double[] gpus = GpuUsages();
+                    bool dual = _cfg.GpuMode == 1 || (_cfg.GpuMode == 0 && gpus[1] >= 0);   // 0=自动 1=双卡 2=单卡
                     double g0 = gpus[0];
                     double g1 = gpus[1];
-                    if (g1 >= 0)
+                    if (dual && g1 >= 0)
                     {
                         _gpuPct.Text = g0.ToString("0") + "% / " + g1.ToString("0") + "%";
                         _gpuSub.Text = "双显卡 1 / 2";
@@ -2479,7 +2484,6 @@ namespace SideDrawer
                         _gpuSub.Text = "显卡占用";
                         SetBar(_gpuBar, g0 / 100.0);
                     }
-                }
                 }
             }
             catch { }
@@ -3716,6 +3720,13 @@ namespace SideDrawer
             _closeTimer.Stop();
         }
 
+        /// <summary>捕获层可见性：点击外部收回 或 菜单打开时启用。</summary>
+        private void UpdateClickCatcher()
+        {
+            if (_clickCatcher == null) return;
+            bool need = _open && (_cfg.CloseOnOutside || _menuOpen);
+            _clickCatcher.Visibility = need ? Visibility.Visible : Visibility.Collapsed;
+        }
         public void Open()
         {
             if (_open || _busy) return;
@@ -3731,6 +3742,7 @@ namespace SideDrawer
             if (_tab != null) _tab.HideNow();
             ApplyOpenBounds();
             Show();
+            UpdateClickCatcher();
             Native.KeepTopmost(new WindowInteropHelper(this).Handle);
             if (_cfg.MusicPanel && _music != null)
             {
@@ -3796,6 +3808,7 @@ namespace SideDrawer
             {
                 _open = false;
                 ApplyClosedBounds();
+                UpdateClickCatcher();
             };
             _shift.BeginAnimation(TranslateTransform.XProperty, a);
             Fade(_overlay, 0.1, 230, 0);
@@ -4189,7 +4202,8 @@ namespace SideDrawer
             }
 
             _menuOpen = true;
-            cm.Closed += delegate { _menuOpen = false; };
+            UpdateClickCatcher();
+            cm.Closed += delegate { _menuOpen = false; UpdateClickCatcher(); };
             cm.PlacementTarget = anchor;
             cm.IsOpen = true;
         }
@@ -4423,13 +4437,13 @@ namespace SideDrawer
             cm.Items.Add(quit);
 
             _menuOpen = true;
-            cm.Closed += delegate { _menuOpen = false; };
+            UpdateClickCatcher();
+            cm.Closed += delegate { _menuOpen = false; UpdateClickCatcher(); };
             cm.PlacementTarget = _glass;
             cm.IsOpen = true;
         }
 
         private Canvas _menuLayer;
-
         private void ClosePanelMenu()
         {
             if (_menuLayer != null)
@@ -4438,6 +4452,7 @@ namespace SideDrawer
                 _menuLayer = null;
             }
             _menuOpen = false;
+            UpdateClickCatcher();
         }
 
         /// <summary>面板内菜单：直接画在侧边栏窗口里，永远在最上层，绝不被遮挡。</summary>
@@ -4445,6 +4460,7 @@ namespace SideDrawer
         {
             ClosePanelMenu();
             _menuOpen = true;
+            UpdateClickCatcher();
 
             _menuLayer = new Canvas();
             _menuLayer.Width = _panelW;
@@ -4533,6 +4549,36 @@ namespace SideDrawer
                 ConfigStore.Save(_cfg);
             }, _cfg.ShowClock);
 
+            AddMenuItem(list, "点击面板外收回", delegate
+            {
+                _cfg.CloseOnOutside = !_cfg.CloseOnOutside;
+                ConfigStore.Save(_cfg);
+                if (_clickCatcher != null && _open)
+            UpdateClickCatcher();
+                ClosePanelMenu();
+            }, _cfg.CloseOnOutside);
+            AddMenuSeparator(list);
+            AddMenuSection(list, "收起按钮配色");
+            AddMenuItem(list, "浅色（默认）", delegate
+            {
+                _cfg.RetractDark = false;
+                ConfigStore.Save(_cfg);
+                RebuildEnvelope();
+                ClosePanelMenu();
+            }, !_cfg.RetractDark);
+            AddMenuItem(list, "深色（更醒目）", delegate
+            {
+                _cfg.RetractDark = true;
+                ConfigStore.Save(_cfg);
+                RebuildEnvelope();
+                ClosePanelMenu();
+            }, _cfg.RetractDark);
+            AddMenuSeparator(list);
+            AddMenuSection(list, "显卡显示");
+            AddMenuItem(list, "自动识别", delegate { _cfg.GpuMode = 0; ConfigStore.Save(_cfg); UpdateWidgets(); ClosePanelMenu(); }, _cfg.GpuMode == 0);
+            AddMenuItem(list, "双显卡（显示两路占用）", delegate { _cfg.GpuMode = 1; ConfigStore.Save(_cfg); UpdateWidgets(); ClosePanelMenu(); }, _cfg.GpuMode == 1);
+            AddMenuItem(list, "单显卡（只显示一路）", delegate { _cfg.GpuMode = 2; ConfigStore.Save(_cfg); UpdateWidgets(); ClosePanelMenu(); }, _cfg.GpuMode == 2);
+            AddMenuSeparator(list);
             AddMenuItem(list, "音乐面板（跟随系统播放器）", delegate
             {
                 _cfg.MusicPanel = !_cfg.MusicPanel;
@@ -4666,6 +4712,7 @@ namespace SideDrawer
         {
             ClosePanelMenu();
             _menuOpen = true;
+            UpdateClickCatcher();
             _menuLayer = new Canvas();
             _menuLayer.Width = _panelW;
             _menuLayer.Height = _panelH;
