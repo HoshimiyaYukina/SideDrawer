@@ -1,0 +1,33 @@
+# 编译产物
+bin/
+obj/
+dist/
+
+# 个人配置与运行日志（含桌面快捷方式路径等本机信息，切勿提交）
+drawer.json
+drawer.json.*
+log.txt
+*.log
+
+# 备份文件
+*.bak
+*.ok.bak
+*.ok*.bak
+_strip.txt
+
+# 未开源/个人内容
+shots/
+ref/
+test/
+portable/
+*.zip
+
+# 打包/IDE
+.vs/
+.vscode/
+*.user
+*.suo
+
+# 系统文件
+Thumbs.db
+desktop.ini
