@@ -26,7 +26,16 @@ namespace SideDrawer
         private Image _backdrop;
         private DispatcherTimer _watch;
         private int _idle;
+        private int _dwell;
+        private int _stillMs;
+        private int _lastPx = int.MinValue;
+        private int _lastPy = int.MinValue;
+        private double _dpiX = 1.0;
+        private double _dpiY = 1.0;
+        private bool _dpiReady;
+        private int _showGen;
         private bool _visible;
+        private bool _tabDown;
 
         public EdgeTabWindow(DrawerWindow owner)
         {
@@ -81,10 +90,11 @@ namespace SideDrawer
             Geometry shape = Ribbon(TabW, TabH, 16, 0);
 
             Grid layers = new Grid();
-            layers.OpacityMask = Glass.Mask(shape, TabW, TabH);
+            layers.Clip = shape;
 
             _backdrop = new Image();
             _backdrop.Stretch = Stretch.Fill;
+            RenderOptions.SetBitmapScalingMode(_backdrop, BitmapScalingMode.Linear);
             layers.Children.Add(_backdrop);
 
             Rectangle tint = new Rectangle();
@@ -94,11 +104,14 @@ namespace SideDrawer
             tb.GradientStops.Add(new GradientStop(Color.FromArgb(96, 255, 255, 255), 0));
             tb.GradientStops.Add(new GradientStop(Color.FromArgb(26, 255, 255, 255), 0.55));
             tb.GradientStops.Add(new GradientStop(Color.FromArgb(44, 255, 255, 255), 1));
+            tb.Freeze();
             tint.Fill = tb;
             layers.Children.Add(tint);
 
             Rectangle veil = new Rectangle();
-            veil.Fill = new SolidColorBrush(Color.FromArgb(108, 8, 8, 16));
+            SolidColorBrush vb = new SolidColorBrush(Color.FromArgb(108, 8, 8, 16));
+            vb.Freeze();
+            veil.Fill = vb;
             layers.Children.Add(veil);
 
             Rectangle noise = new Rectangle();
@@ -106,6 +119,7 @@ namespace SideDrawer
             nb.TileMode = TileMode.Tile;
             nb.Viewport = new Rect(0, 0, 64, 64);
             nb.ViewportUnits = BrushMappingMode.Absolute;
+            nb.Freeze();
             noise.Fill = nb;
             noise.Opacity = 0.035;
             layers.Children.Add(noise);
@@ -116,6 +130,7 @@ namespace SideDrawer
             gb.EndPoint = new Point(0, 1);
             gb.GradientStops.Add(new GradientStop(Color.FromArgb(110, 255, 255, 255), 0));
             gb.GradientStops.Add(new GradientStop(Color.FromArgb(0, 255, 255, 255), 0.45));
+            gb.Freeze();
             glint.Fill = gb;
             layers.Children.Add(glint);
 
@@ -129,6 +144,7 @@ namespace SideDrawer
             rb.GradientStops.Add(new GradientStop(Color.FromArgb(215, 255, 255, 255), 0));
             rb.GradientStops.Add(new GradientStop(Color.FromArgb(90, 255, 255, 255), 0.5));
             rb.GradientStops.Add(new GradientStop(Color.FromArgb(150, 255, 255, 255), 1));
+            rb.Freeze();
             rim.Stroke = rb;
             rim.StrokeThickness = 1;
             _tab.Children.Add(rim);
@@ -137,7 +153,9 @@ namespace SideDrawer
             chev.Text = "\uE76C";
             chev.FontFamily = new FontFamily("Segoe MDL2 Assets");
             chev.FontSize = 12;
-            chev.Foreground = new SolidColorBrush(Color.FromArgb(240, 255, 255, 255));
+            SolidColorBrush chevFg = new SolidColorBrush(Color.FromArgb(240, 255, 255, 255));
+            chevFg.Freeze();
+            chev.Foreground = chevFg;
             chev.HorizontalAlignment = HorizontalAlignment.Right;
             chev.VerticalAlignment = VerticalAlignment.Center;
             chev.Margin = new Thickness(0);
@@ -147,12 +165,25 @@ namespace SideDrawer
             ce.BlurRadius = 6;
             ce.ShadowDepth = 0;
             ce.Opacity = 0.65;
+            ce.Freeze();
             chev.Effect = ce;
             _tab.Children.Add(chev);
 
+            _tab.MouseLeftButtonDown += delegate(object s, MouseButtonEventArgs e)
+            {
+                e.Handled = true;
+                int guard = _owner != null ? _owner.EdgeGuardMode : 1;
+                if (guard > 0 && Native.IsCursorCapturedOrHidden()) { _tabDown = false; HideNow(); return; }
+                _tabDown = true;
+            };
+            _tab.MouseLeave += delegate { _tabDown = false; };
             _tab.MouseLeftButtonUp += delegate(object s, MouseButtonEventArgs e)
             {
                 e.Handled = true;
+                if (!_tabDown) return;
+                _tabDown = false;
+                int guard = _owner != null ? _owner.EdgeGuardMode : 1;
+                if (guard > 0 && Native.IsCursorCapturedOrHidden()) { HideNow(); return; }
                 HideNow();
                 if (_owner != null) _owner.OpenFromEdge();
             };
@@ -201,37 +232,134 @@ namespace SideDrawer
             g.Freeze();
             return g;
         }
+        private void EnsureDpi()
+        {
+            if (_dpiReady) return;
+            try
+            {
+                PresentationSource ps = PresentationSource.FromVisual(this);
+                if (ps != null && ps.CompositionTarget != null)
+                {
+                    Matrix m = ps.CompositionTarget.TransformToDevice;
+                    if (m.M11 > 0.1 && m.M22 > 0.1)
+                    {
+                        _dpiX = m.M11;
+                        _dpiY = m.M22;
+                        _dpiReady = true;
+                        if (_tab != null) _tab.CacheMode = Glass.MakeCache(this);
+                        Program.Log("tab ready dpi=" + _dpiX.ToString("0.00") + " left=" + Left.ToString("0") + " top=" + Top.ToString("0") + " h=" + Height.ToString("0") + " guard=" + (_owner != null ? _owner.EdgeGuardMode : -1));
+                    }
+                }
+            }
+            catch { }
+        }
+
         /// <summary>用光标位置判断，不依赖 WPF 的鼠标进出事件（分层窗口不可靠）。</summary>
         private void Watch()
         {
+            EnsureDpi();
+
             bool ownerOpen = _owner != null && _owner.IsOpen;
             if (ownerOpen)
             {
                 if (_visible) HideNow();
                 _idle = 0;
+                _dwell = 0;
                 return;
             }
 
             Native.POINT p;
             if (!Native.GetCursorPos(out p)) return;
-            double[] d = Glass.Dpi(this);
-            if (d[0] <= 0) d[0] = 1;
-            if (d[1] <= 0) d[1] = 1;
-            double x = p.X / d[0];
-            double y = p.Y / d[1];
+
+            if (p.X == _lastPx && p.Y == _lastPy)
+            {
+                if (_stillMs < 5000) _stillMs += 60;
+            }
+            else
+            {
+                _lastPx = p.X;
+                _lastPy = p.Y;
+                _stillMs = 0;
+            }
+
+            double x = p.X / _dpiX;
+            double y = p.Y / _dpiY;
 
             bool inTabBand = y >= TabTop - 40 && y <= TabTop + TabH + 40;
             bool nearEdge = x >= Left - 2 && x <= Left + HotW && inTabBand;
             bool overTab = _visible && x >= Left && x <= Left + TabW + 10
                            && y >= TabTop - 10 && y <= TabTop + TabH + 10;
 
+            int guard = _owner != null ? _owner.EdgeGuardMode : 1;
+            bool desktopFg = false;
+            if (guard > 0)
+            {
+                // 光标被隐藏（CURSOR_SHOWING==0）或被 ClipCursor 锁定 → 游戏接管鼠标，立即屏蔽
+                if (Native.IsCursorCapturedOrHidden())
+                {
+                    _dwell = 0;
+                    _idle = 0;
+                    if (_visible) HideNow();
+                    return;
+                }
+
+                // 按住鼠标键（开枪 / 拖拽）：未弹出时不弹出；已弹出且不在书签上时立即隐藏
+                // 注意：若书签已弹出且光标正落在书签上，允许用户正常左键点击展开！
+                if (Native.IsAnyMouseButtonDown())
+                {
+                    if (!_visible)
+                    {
+                        _dwell = 0;
+                        return;
+                    }
+                    if (!overTab)
+                    {
+                        _dwell = 0;
+                        _idle = 0;
+                        HideNow();
+                        return;
+                    }
+                }
+
+                desktopFg = Native.IsDesktopForeground();
+
+                // 方案 A（模式 2）：仅桌面/任务栏在前台时启用边缘热区
+                if (guard == 2 && !desktopFg)
+                {
+                    _dwell = 0;
+                    _idle = 0;
+                    if (_visible) HideTab();
+                    return;
+                }
+            }
+
             if (nearEdge || overTab)
             {
                 _idle = 0;
-                if (!_visible) ShowTab();
+                if (!_visible)
+                {
+                    // Raw Input 游戏：光标可能死停在进入游戏时的左边缘位置（静止超过 1 秒且非桌面）
+                    if (guard > 0 && !desktopFg && _stillMs >= 1000)
+                    {
+                        _dwell = 0;
+                        return;
+                    }
+
+                    int needDwell = 0;
+                    if (guard == 1) needDwell = desktopFg ? 60 : 220;
+                    else if (guard == 2) needDwell = 120;
+
+                    _dwell += 60;
+                    if (_dwell >= needDwell)
+                    {
+                        _dwell = 0;
+                        ShowTab();
+                    }
+                }
             }
             else
             {
+                _dwell = 0;
                 _idle += 60;
                 if (_visible && _idle >= 420) HideTab();
             }
@@ -243,20 +371,20 @@ namespace SideDrawer
         {
             if (_visible) return;
             _visible = true;
+            int gen = ++_showGen;
 
-            try
+            // 先立刻弹出动画（0ms 阻塞），背景毛玻璃在后台线程异步抓取并回填
+            Glass.BackdropAsync(Left, Top + TabTop, TabW, TabH, this, delegate(ImageSource shot)
             {
-                ImageSource shot = Glass.Backdrop(Left, Top + TabTop, TabW, TabH, this);
-                if (shot != null) _backdrop.Source = shot;
-            }
-            catch { }
+                if (!_visible || gen != _showGen || shot == null) return;
+                _backdrop.Source = shot;
+            });
 
             try { Native.KeepTopmost(new WindowInteropHelper(this).Handle); } catch { }
-            try { Point scr = _tab.PointToScreen(new Point(0, 0)); Program.Log("tab screen=" + scr.X.ToString("0") + "," + scr.Y.ToString("0") + " dpi=" + Glass.Dpi(this)[0].ToString("0.00") + " winTop=" + Top.ToString("0") + " winH=" + Height.ToString("0")); } catch { }
 
             _shift.BeginAnimation(TranslateTransform.XProperty, null);
             _shift.X = -TabW - 8;
-            DoubleAnimation a = new DoubleAnimation(0, TimeSpan.FromMilliseconds(280));
+            DoubleAnimation a = new DoubleAnimation(0, TimeSpan.FromMilliseconds(260));
             a.EasingFunction = new BackEase { Amplitude = 0.22, EasingMode = EasingMode.EaseOut };
             _shift.BeginAnimation(TranslateTransform.XProperty, a);
         }
@@ -265,7 +393,9 @@ namespace SideDrawer
         {
             if (!_visible) return;
             _visible = false;
-            DoubleAnimation a = new DoubleAnimation(-TabW - 8, TimeSpan.FromMilliseconds(200));
+            _tabDown = false;
+            _showGen++;
+            DoubleAnimation a = new DoubleAnimation(-TabW - 8, TimeSpan.FromMilliseconds(190));
             a.EasingFunction = new CubicEase { EasingMode = EasingMode.EaseIn };
             _shift.BeginAnimation(TranslateTransform.XProperty, a);
         }
@@ -273,7 +403,10 @@ namespace SideDrawer
         public void HideNow()
         {
             _visible = false;
+            _tabDown = false;
+            _showGen++;
             _idle = 0;
+            _dwell = 0;
             _shift.BeginAnimation(TranslateTransform.XProperty, null);
             _shift.X = -TabW - 8;
         }
@@ -284,6 +417,7 @@ namespace SideDrawer
             IntPtr h = new WindowInteropHelper(this).Handle;
             int ex = Native.GetWindowLong(h, Native.GWL_EXSTYLE);
             Native.SetWindowLong(h, Native.GWL_EXSTYLE, ex | Native.WS_EX_TOOLWINDOW | Native.WS_EX_NOACTIVATE);
+            EnsureDpi();
         }
     }
 }

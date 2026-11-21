@@ -95,6 +95,8 @@ namespace SideDrawer
         public bool CloseOnOutside = false;   // 点击面板外收回（默认关，保持原行为）
         public int GpuMode = 0;               // 0=自动 1=双卡 2=单卡
         public bool RetractDark = false;      // 收起按钮：false=浅色 true=深色
+        public int EdgeGuard = 1;             // 边缘防误触：0=关闭 1=智能防误触（默认） 2=仅桌面触发
+        public bool PanelBlur = true;         // 主侧边栏模糊玻璃：true=实时亚克力 false=清透玻璃
         public List<GroupDef> Groups = new List<GroupDef>();
         public List<ItemCfg> Pins = new List<ItemCfg>();
         public List<ItemCfg> Dock = new List<ItemCfg>();
@@ -199,6 +201,8 @@ namespace SideDrawer
             if (d.ContainsKey("closeOnOutside")) c.CloseOnOutside = Convert.ToBoolean(d["closeOnOutside"]);
             if (d.ContainsKey("gpuMode")) c.GpuMode = Convert.ToInt32(d["gpuMode"]);
             if (d.ContainsKey("retractDark")) c.RetractDark = Convert.ToBoolean(d["retractDark"]);
+            if (d.ContainsKey("edgeGuard")) c.EdgeGuard = Convert.ToInt32(d["edgeGuard"]);
+            if (d.ContainsKey("panelBlur")) c.PanelBlur = Convert.ToBoolean(d["panelBlur"]);
                         if (d.ContainsKey("pins"))
                             foreach (object o in (System.Collections.IEnumerable)d["pins"])
                             {
@@ -408,6 +412,8 @@ namespace SideDrawer
                 d["closeOnOutside"] = c.CloseOnOutside;
                 d["gpuMode"] = c.GpuMode;
                 d["retractDark"] = c.RetractDark;
+                d["edgeGuard"] = c.EdgeGuard;
+                d["panelBlur"] = c.PanelBlur;
                 List<object> pins = new List<object>();
                 foreach (ItemCfg i in c.Pins) pins.Add(ItemToJson(i));
                 d["pins"] = pins;
@@ -512,6 +518,49 @@ namespace SideDrawer
         private static readonly Dictionary<string, ImageSource> _cache =
             new Dictionary<string, ImageSource>(StringComparer.OrdinalIgnoreCase);
         private static readonly object _lock = new object();
+        private static readonly object _trimLock = new object();
+        private static byte[] _trimBuf;
+        private static readonly ImageSource _emptyIcon = MakeEmptyIcon();
+
+        private static ImageSource MakeEmptyIcon()
+        {
+            DrawingImage di = new DrawingImage();
+            di.Freeze();
+            return di;
+        }
+
+        public static bool Has(string path)
+        {
+            if (string.IsNullOrEmpty(path)) return false;
+            lock (_lock) return _cache.ContainsKey(path);
+        }
+
+        public static void WarmupAsync(List<string> paths)
+        {
+            if (paths == null || paths.Count == 0) return;
+            Thread th = new Thread(delegate()
+            {
+                try
+                {
+                    Thread.Sleep(450);
+                    for (int i = 0; i < paths.Count; i++)
+                    {
+                        string p = paths[i];
+                        if (string.IsNullOrEmpty(p) || Has(p)) continue;
+                        try
+                        {
+                            if (ConfigStore.Alive(p)) Get(p);
+                        }
+                        catch { }
+                    }
+                }
+                catch { }
+            });
+            th.IsBackground = true;
+            th.Priority = ThreadPriority.BelowNormal;
+            th.SetApartmentState(ApartmentState.STA);
+            th.Start();
+        }
 
         public static ImageSource Get(string path)
         {
@@ -541,7 +590,7 @@ namespace SideDrawer
             ImageSource src = null;
             try { src = LoadHighQuality(path); } catch { }
             if (src == null) { try { src = LoadFallback(path); } catch { } }
-            if (src == null) src = new DrawingImage();
+            if (src == null) src = _emptyIcon;
             else { try { ImageSource t = Trim(src); if (t != null) src = t; } catch { } }
             lock (_lock) { _cache[path] = src; }
             return src;
@@ -558,21 +607,26 @@ namespace SideDrawer
             int w = bgra.PixelWidth, h = bgra.PixelHeight;
             if (w < 2 || h < 2 || w > 512 || h > 512) return src;
             int stride = w * 4;
-            byte[] px = new byte[stride * h];
-            bgra.CopyPixels(px, stride, 0);
+            int need = stride * h;
 
             int minX = w, minY = h, maxX = -1, maxY = -1;
-            for (int y = 0; y < h; y++)
+            lock (_trimLock)
             {
-                int row = y * stride;
-                for (int x = 0; x < w; x++)
+                if (_trimBuf == null || _trimBuf.Length < need) _trimBuf = new byte[need];
+                bgra.CopyPixels(_trimBuf, stride, 0);
+
+                for (int y = 0; y < h; y++)
                 {
-                    if (px[row + x * 4 + 3] > 20)
+                    int row = y * stride;
+                    for (int x = 0; x < w; x++)
                     {
-                        if (x < minX) minX = x;
-                        if (x > maxX) maxX = x;
-                        if (y < minY) minY = y;
-                        if (y > maxY) maxY = y;
+                        if (_trimBuf[row + x * 4 + 3] > 20)
+                        {
+                            if (x < minX) minX = x;
+                            if (x > maxX) maxX = x;
+                            if (y < minY) minY = y;
+                            if (y > maxY) maxY = y;
+                        }
                     }
                 }
             }
@@ -735,6 +789,108 @@ namespace SideDrawer
         [DllImport("user32.dll")]
         public static extern uint GetDpiForSystem();
 
+        [StructLayout(LayoutKind.Sequential)]
+        public struct CURSORINFO
+        {
+            public int cbSize;
+            public int flags;
+            public IntPtr hCursor;
+            public POINT ptScreenPos;
+        }
+
+        public const int CURSOR_SHOWING = 0x00000001;
+        private const int VK_LBUTTON = 0x01;
+        private const int VK_RBUTTON = 0x02;
+        private const int VK_MBUTTON = 0x04;
+        private const int VREFRESH = 116;
+
+        [DllImport("user32.dll")]
+        private static extern bool GetCursorInfo(ref CURSORINFO pci);
+        [DllImport("user32.dll")]
+        private static extern bool GetClipCursor(out RECT lpRect);
+        [DllImport("user32.dll")]
+        private static extern short GetAsyncKeyState(int vKey);
+        [DllImport("user32.dll")]
+        private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetDC(IntPtr hWnd);
+        [DllImport("user32.dll")]
+        private static extern int ReleaseDC(IntPtr hWnd, IntPtr hDC);
+        [DllImport("gdi32.dll")]
+        private static extern int GetDeviceCaps(IntPtr hdc, int nIndex);
+
+        private static readonly uint _selfPid = (uint)Process.GetCurrentProcess().Id;
+
+        public static int DisplayRefreshRate()
+        {
+            IntPtr hdc = IntPtr.Zero;
+            try
+            {
+                hdc = GetDC(IntPtr.Zero);
+                if (hdc != IntPtr.Zero)
+                {
+                    int hz = GetDeviceCaps(hdc, VREFRESH);
+                    if (hz >= 60 && hz <= 360) return Math.Min(hz, 240);
+                }
+            }
+            catch { }
+            finally { if (hdc != IntPtr.Zero) ReleaseDC(IntPtr.Zero, hdc); }
+            return 60;
+        }
+
+        public static bool IsAnyMouseButtonDown()
+        {
+            return (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0
+                || (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0
+                || (GetAsyncKeyState(VK_MBUTTON) & 0x8000) != 0;
+        }
+
+        /// <summary>检测光标是否被游戏隐藏或被 ClipCursor 限制在局部区域。</summary>
+        public static bool IsCursorCapturedOrHidden()
+        {
+            try
+            {
+                CURSORINFO ci = new CURSORINFO();
+                ci.cbSize = Marshal.SizeOf(typeof(CURSORINFO));
+                if (GetCursorInfo(ref ci) && (ci.flags & CURSOR_SHOWING) == 0)
+                    return true;
+
+                RECT clip;
+                if (GetClipCursor(out clip))
+                {
+                    int cw = clip.Right - clip.Left;
+                    int ch = clip.Bottom - clip.Top;
+                    int sw = GetSystemMetrics(0);
+                    int sh = GetSystemMetrics(1);
+                    if (sw > 0 && sh > 0 && (cw < sw - 8 || ch < sh - 8))
+                        return true;
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        /// <summary>判断前台窗口是否为桌面 / 任务栏 / 本程序自身。</summary>
+        public static bool IsDesktopForeground()
+        {
+            try
+            {
+                IntPtr h = GetForegroundWindow();
+                if (h == IntPtr.Zero) return true;
+                uint pid;
+                GetWindowThreadProcessId(h, out pid);
+                if (pid == _selfPid) return true;
+
+                StringBuilder sb = new StringBuilder(128);
+                GetClassName(h, sb, 128);
+                string cls = sb.ToString();
+                if (cls == "Progman" || cls == "WorkerW" || cls == "Shell_TrayWnd" || cls == "Shell_SecondaryTrayWnd")
+                    return true;
+            }
+            catch { }
+            return false;
+        }
+
         public static bool ForegroundIsFullscreen()
         {
             IntPtr h = GetForegroundWindow();
@@ -750,10 +906,142 @@ namespace SideDrawer
         }
     }
 
+    /// <summary>帧率无关的阻尼平滑滚动器：只在滚轮滑动时挂钩渲染帧，静止后自动解绑零开销。</summary>
+    internal sealed class SmoothScroller
+    {
+        private readonly ScrollViewer _sv;
+        private double _target;
+        private double _current;
+        private bool _active;
+        private long _lastTicks;
+
+        public SmoothScroller(ScrollViewer sv)
+        {
+            _sv = sv;
+            _sv.PreviewMouseWheel += OnWheel;
+        }
+
+        private void OnWheel(object sender, MouseWheelEventArgs e)
+        {
+            if (_sv == null || _sv.ScrollableHeight <= 0.5) return;
+            e.Handled = true;
+            ScrollByDelta(e.Delta);
+        }
+
+        private double SnapToPhysicalPixel(double dip)
+        {
+            double dpi = 1.0;
+            try
+            {
+                double[] d = Glass.Dpi(_sv);
+                if (d[1] >= 1.0 && d[1] <= 3.0) dpi = d[1];
+            }
+            catch { }
+            return Math.Round(dip * dpi) / dpi;
+        }
+
+        public void ScrollByDelta(int delta)
+        {
+            if (_sv == null || _sv.ScrollableHeight <= 0.5) return;
+            if (!_active)
+            {
+                _current = _sv.VerticalOffset;
+                _target = _current;
+            }
+            _target -= delta * 0.65;
+            if (_target < 0) _target = 0;
+            if (_target > _sv.ScrollableHeight) _target = _sv.ScrollableHeight;
+            _target = SnapToPhysicalPixel(_target);
+
+            if (!_active)
+            {
+                _active = true;
+                _lastTicks = Stopwatch.GetTimestamp();
+                CompositionTarget.Rendering += OnRender;
+            }
+        }
+
+        public void Stop()
+        {
+            if (!_active) return;
+            _active = false;
+            CompositionTarget.Rendering -= OnRender;
+        }
+
+        private void OnRender(object sender, EventArgs e)
+        {
+            if (!_active || _sv == null) { Stop(); return; }
+            long now = Stopwatch.GetTimestamp();
+            double dt = (now - _lastTicks) / (double)Stopwatch.Frequency;
+            _lastTicks = now;
+            if (dt <= 0) dt = 0.008;
+            if (dt > 0.05) dt = 0.05;
+
+            if (_target > _sv.ScrollableHeight) _target = _sv.ScrollableHeight;
+            if (_target < 0) _target = 0;
+
+            double diff = _target - _current;
+            if (Math.Abs(diff) < 0.35)
+            {
+                _current = SnapToPhysicalPixel(_target);
+                _sv.ScrollToVerticalOffset(_current);
+                Stop();
+                return;
+            }
+
+            double alpha = 1.0 - Math.Exp(-18.0 * dt);
+            _current += diff * alpha;
+            _sv.ScrollToVerticalOffset(_current);
+        }
+    }
+
+    /// <summary>主侧边栏右侧「收起」把手伴随窗口：随主面板同步滑动，避免凸出部分被紧贴主窗裁掉。</summary>
+    internal sealed class RetractHandleWindow : Window
+    {
+        private IntPtr _hwnd;
+        public RetractHandleWindow()
+        {
+            WindowStyle = WindowStyle.None;
+            AllowsTransparency = true;
+            Background = Brushes.Transparent;
+            Topmost = true;
+            ShowInTaskbar = false;
+            ShowActivated = false;
+            ResizeMode = ResizeMode.NoResize;
+            WindowStartupLocation = WindowStartupLocation.Manual;
+            Title = "SideDrawerRetract";
+            Width = 46;
+            Height = 368;
+            Left = -20000;
+            Top = 0;
+        }
+
+        protected override void OnSourceInitialized(EventArgs e)
+        {
+            base.OnSourceInitialized(e);
+            _hwnd = new WindowInteropHelper(this).Handle;
+            int ex = Native.GetWindowLong(_hwnd, Native.GWL_EXSTYLE);
+            Native.SetWindowLong(_hwnd, Native.GWL_EXSTYLE, ex | Native.WS_EX_TOOLWINDOW | Native.WS_EX_NOACTIVATE);
+        }
+
+        public void MovePx(int xPx, int yPx)
+        {
+            if (_hwnd != IntPtr.Zero) DwmGlass.MovePx(_hwnd, xPx, yPx);
+        }
+
+        public void KeepTopmost()
+        {
+            if (IsVisible && _hwnd != IntPtr.Zero)
+            {
+                try { Native.KeepTopmost(_hwnd); } catch { }
+            }
+        }
+    }
+
     // ---------------------------------------------------------------- window
     internal sealed class DrawerWindow : Window
     {
-        private const double Radius = 16;
+        private const double Radius = 8;   // 精确贴合 Win11 原生 DWMWCP_ROUND 硬件圆角
         private const double HotW = 6;
         private const double HotH = 320;
 
@@ -820,9 +1108,40 @@ namespace SideDrawer
         private DispatcherTimer _glassTimer;
         private int _refractTick;
         private DispatcherTimer _clockTimer;
+        private DispatcherTimer _topTimer;
+        private DispatcherTimer _outsideTimer;
+        private bool _outsidePrevDown;
+        private ScrollViewer _homeScroll;
+        private SmoothScroller _homeScroller;
+        private SmoothScroller _tagScroller;
+        private volatile int _animGen;
+        private bool _everOpened;
+        private int _widgetBusy;
+        private int _pruneBusy;
+        private IntPtr _hwnd;
+        private double _dpiX = 1.0;
+        private double _dpiY = 1.0;
+        private volatile bool _sliding;
+        private bool _slideOpening;
+        private bool _slideClockStarted;
+        private bool _slideFirstVisibleSync;
+        private double _slideFromX;
+        private double _slideToX;
+        private double _slideDurMs;
+        private long _slideStartTicks;
+        private int _slideGen;
+        private Rectangle _vignette;
+        private bool _fpsHooked;
+        private string _fpsTag;
+        private long _fpsStartTicks;
+        private long _fpsLastTicks;
+        private int _fpsFrames;
+        private double _fpsWorstMs;
         private EdgeTabWindow _tab;
+        private RetractHandleWindow _envWin;
         private Grid _envelope;
         private StackPanel _tagRail;
+        private Window _tagWin;
         private Border _tagPanel;
         private int _tagOpen = -1;
         private double _tagW = 300;
@@ -847,19 +1166,20 @@ namespace SideDrawer
         {
             _cfg = ConfigStore.Load();
 
-            WindowStyle = WindowStyle.None;
-            AllowsTransparency = true;
-            Background = Brushes.Transparent;
+            DwmGlass.PrepareWindow(this);
             Topmost = true;
             ShowInTaskbar = false;
             ShowActivated = false;
-            ResizeMode = ResizeMode.NoResize;
             WindowStartupLocation = WindowStartupLocation.Manual;
             Title = "SideDrawer";
             UseLayoutRounding = true;
             SnapsToDevicePixels = true;
             TextOptions.SetTextFormattingMode(this, TextFormattingMode.Display);
             TextOptions.SetTextRenderingMode(this, TextRenderingMode.Grayscale);
+            Left = -20000;
+            Top = 0;
+            Width = 10;
+            Height = 10;
 
             Loaded += delegate { EnsurePanels(); if (!_open) ApplyClosedBounds(); };
         }
@@ -894,11 +1214,7 @@ namespace SideDrawer
                 if (_tagOpen >= 0) return;
                 if (_dragging || _tagDragging) return;
                 if (Mouse.LeftButton == MouseButtonState.Pressed) return;
-                Point mp = Mouse.GetPosition(this);
-                bool overPanel = mp.X >= 0 && mp.X <= _panelW && mp.Y >= 0 && mp.Y <= ActualHeight;
-                if (overPanel) return;
-                if (_music != null && _music.IsShown && CursorInsideMusic()) return;
-                if (CursorOverTagPanel()) return;
+                if (CursorInsideAnyDrawerWindow()) return;
                 CloseDrawer();
             };
 
@@ -907,23 +1223,91 @@ namespace SideDrawer
             int ticks = 0;
             _clockTimer.Tick += delegate
             {
+                if (!_open) return;
                 UpdateClock();
-                if (++ticks % 3 == 0 && _memPct != null) UpdateWidgets();
-                _specWantPlay = _music != null && _music.IsPlayingNow();
+                if (++ticks % 4 == 0 && _memPct != null) RequestWidgetsUpdate();
             };
-            _clockTimer.Start();
-            StartSpectrumThread();
 
-            DispatcherTimer topTimer = new DispatcherTimer();
-            topTimer.Interval = TimeSpan.FromMilliseconds(600);
-            topTimer.Tick += delegate
+            // 不再每 600ms 盲目调 SetWindowPos(HWND_TOPMOST)：对 DWM BlurBehind 窗口高频置顶会引发桌面合成器刷新与鼠标微卡顿
+            // 窗口本身已设 Topmost=true，且在 OpenCore() 与菜单关闭时自动置顶
+            _topTimer = null;
+
+            _outsideTimer = new DispatcherTimer();
+            _outsideTimer.Interval = TimeSpan.FromMilliseconds(40);
+            _outsideTimer.Tick += delegate
             {
-                if (!_open || _busy || _menuOpen) return;   // 菜单打开期间不抢回置顶
-                try { Native.KeepTopmost(new WindowInteropHelper(this).Handle); } catch { }
+                if (!_open || _busy || _dragging || _tagDragging) { _outsidePrevDown = false; return; }
+                bool down = Native.IsAnyMouseButtonDown();
+                if (down && !_outsidePrevDown)
+                {
+                    if (!CursorInsideAnyDrawerWindow())
+                    {
+                        if (_menuOpen) ClosePanelMenu();
+                        else if (_cfg.CloseOnOutside) CloseDrawer();
+                    }
+                }
+                _outsidePrevDown = down;
             };
-            topTimer.Start();
             UpdateClock();
 
+        }
+
+        public int EdgeGuardMode { get { return _cfg != null ? _cfg.EdgeGuard : 1; } }
+
+        private void RefreshDpi()
+        {
+            try
+            {
+                double[] d = Glass.Dpi(this);
+                if (d[0] > 0.1) _dpiX = d[0];
+                if (d[1] > 0.1) _dpiY = d[1];
+            }
+            catch { }
+        }
+
+        private void ApplyPanelBlur(bool sliding)
+        {
+            ApplyPanelBlur(sliding, false);
+        }
+
+        private void ApplyPanelBlur(bool sliding, bool rebindVisible)
+        {
+            if (_vignette != null)
+                _vignette.Visibility = _cfg.PanelBlur ? Visibility.Collapsed : Visibility.Visible;
+            if (_hwnd == IntPtr.Zero) return;
+            int state = _cfg.PanelBlur ? DwmGlass.ACCENT_ENABLE_BLURBEHIND : DwmGlass.ACCENT_DISABLED;
+            bool needRebind = rebindVisible && IsVisible && _open;
+            DwmGlass.SetAccent(_hwnd, state, 0, 0, 0, 0, needRebind);
+            if (needRebind) InvalidateVisual();
+        }
+
+        private bool CursorInsideAnyDrawerWindow()
+        {
+            Native.POINT p;
+            if (!Native.GetCursorPos(out p)) return true;
+            RefreshDpi();
+            double x = p.X / _dpiX;
+            double y = p.Y / _dpiY;
+
+            // 主面板区域
+            if (x >= _workArea.Left && x <= _workArea.Left + _panelW && y >= _workArea.Top && y <= _workArea.Top + _panelH)
+                return true;
+            // 右侧收起把手区域
+            if (_envWin != null && _envWin.IsVisible)
+            {
+                double el = _workArea.Left + _panelW - 8;
+                double et = _workArea.Top + (_panelH - _envWin.Height) / 2.0;
+                if (x >= el && x <= el + _envWin.Width && y >= et && y <= et + _envWin.Height) return true;
+            }
+            // 音乐面板区域
+            if (_music != null && _music.IsShown && _music.ContainsPoint(x, y)) return true;
+            // 标签弹窗区域
+            if (_tagWin != null && _tagWin.IsVisible)
+            {
+                if (x >= _tagWin.Left && x <= _tagWin.Left + _tagWin.Width && y >= _tagWin.Top && y <= _tagWin.Top + _tagWin.Height)
+                    return true;
+            }
+            return false;
         }
 
         private void EnsurePanels()
@@ -944,27 +1328,35 @@ namespace SideDrawer
             if (_music == null || !_music.IsShown) return false;
             Native.POINT p;
             if (!Native.GetCursorPos(out p)) return false;
-            double[] d = Glass.Dpi(this);
-            double x = p.X / d[0];
-            double y = p.Y / d[1];
-            double left = ActualWidth - (MusicPanel.PW * MusicPanel.S) - 18;
-            double top = 26;
-            return x >= left && x <= left + (MusicPanel.PW * MusicPanel.S) && y >= top && y <= top + (MusicPanel.PH * MusicPanel.S);
+            RefreshDpi();
+            double x = p.X / _dpiX;
+            double y = p.Y / _dpiY;
+            return _music.ContainsPoint(x, y);
         }
 
         // ------------------------------------------------------------ geometry
         private void ApplyClosedBounds()
         {
             if (_root == null) return;
+            StopDrawerSlide();
+            if (_clockTimer != null) _clockTimer.Stop();
+            if (_topTimer != null) _topTimer.Stop();
+            if (_outsideTimer != null) _outsideTimer.Stop();
+            if (_homeScroller != null) _homeScroller.Stop();
+            if (_tagScroller != null) _tagScroller.Stop();
+            if (_envWin != null) { try { _envWin.Hide(); } catch { } }
             Rect wa = _workArea;
-            Left = wa.Left;
+            // 不调用 Hide()：保留 D3D 交换链常驻显存，下次滑出时所有图标和卡片从第 1 像素起就完整可见（不会只见空框）
+            Left = -20000;
             Top = wa.Top;
             Width = _panelW;
             Height = _panelH;
-            _panelHost.CacheMode = new BitmapCache(1.0);   // 动画期间改用位图缓存，减少每帧重绘
+            if (_hwnd != IntPtr.Zero) DwmGlass.MovePx(_hwnd, -20000, (int)Math.Round(wa.Top * _dpiY));
+            _panelHost.CacheMode = null;
+            _panelHost.BeginAnimation(UIElement.OpacityProperty, null);
+            _panelHost.Opacity = 1;
             _shift.BeginAnimation(TranslateTransform.XProperty, null);
-            _shift.X = -_panelW;
-            Hide();
+            _shift.X = 0;
         }
 
         private void ApplyOpenBounds()
@@ -972,8 +1364,8 @@ namespace SideDrawer
             Rect wa = _workArea;
             Left = wa.Left;
             Top = wa.Top;
-            Width = wa.Width;
-            Height = wa.Height;
+            Width = _panelW;
+            Height = _panelH;
         }
 
         // ------------------------------------------------------------ ui
@@ -982,16 +1374,8 @@ namespace SideDrawer
             _root = new Grid();
             _root.Background = Brushes.Transparent;
 
-            // 「点击面板外收回」用的透明捕获层（alpha=1，肉眼不可见但能接收点击）
             _clickCatcher = new Rectangle();
-            _clickCatcher.Fill = new SolidColorBrush(Color.FromArgb(1, 0, 0, 0));
-                UpdateClickCatcher();
-            _clickCatcher.MouseLeftButtonUp += delegate
-            {
-                if (_menuOpen) { ClosePanelMenu(); return; }   // 菜单开着：点外面先关菜单
-                if (_open && _cfg.CloseOnOutside) CloseDrawer();
-            };
-            _root.Children.Add(_clickCatcher);
+            _clickCatcher.Visibility = Visibility.Collapsed;
             Content = _root;
 
             _nub = BuildNub();
@@ -1006,13 +1390,13 @@ namespace SideDrawer
             _panelHost.HorizontalAlignment = HorizontalAlignment.Left;
             _panelHost.Margin = new Thickness(0);
             _panelHost.Width = _panelW;
-            _shift = new TranslateTransform(-_panelW, 0);
+            _panelHost.Height = _panelH;
+            _shift = new TranslateTransform(0, 0);
             _panelHost.RenderTransform = _shift;
             _root.Children.Add(_panelHost);
 
             MusicPanel.SetScale(_uiScale);
             _music = new MusicPanel();
-            _root.Children.Add(_music);
             if (Environment.GetEnvironmentVariable("SIDEDRAWER_MARK") == "1")
             {
                 Canvas cv = new Canvas();
@@ -1048,7 +1432,9 @@ namespace SideDrawer
             // 去掉整块玻璃的阴影：44px 模糊每帧重绘，滑动时会掉帧'
 
             _overlay = new Grid();
-            _overlay.OpacityMask = RoundedMask(_panelW, _panelH, Radius);
+            RectangleGeometry overlayClip = new RectangleGeometry(new Rect(0, 0, Math.Max(2, _panelW - 2), Math.Max(2, _panelH - 2)), Radius - 1, Radius - 1);
+            overlayClip.Freeze();
+            _overlay.Clip = overlayClip;
             _glass.Child = _overlay;
             _panelHost.Children.Add(_glass);
 
@@ -1059,23 +1445,14 @@ namespace SideDrawer
             lg.GradientStops.Add(Stop(Color.FromArgb(18, 255, 255, 255), 0.45));
             lg.GradientStops.Add(Stop(Color.FromArgb(34, 255, 255, 255), 1));
             lg.GradientStops.Add(Stop(Color.FromArgb(34, 255, 255, 255), 1));
+            lg.Freeze();
             tint.Fill = lg;
 
 
             _veil = new Rectangle();
-            _veil.Fill = new SolidColorBrush(ToArgb(VeilAlpha(), 10, 10, 16));
-
-
-            Rectangle glow = new Rectangle();
-            RadialGradientBrush rg = new RadialGradientBrush();
-            rg.Center = new Point(0.2, 0.0);
-            rg.GradientOrigin = new Point(0.15, 0.0);
-            rg.RadiusX = 1.1;
-            rg.RadiusY = 0.65;
-            rg.GradientStops.Add(Stop(Color.FromArgb(70, 255, 255, 255), 0));
-            rg.GradientStops.Add(Stop(Color.FromArgb(0, 255, 255, 255), 1));
-            glow.Fill = rg;
-
+            SolidColorBrush veilInit = new SolidColorBrush(ToArgb(VeilAlpha(), 10, 10, 16));
+            veilInit.Freeze();
+            _veil.Fill = veilInit;
 
             Rectangle scrimTop = new Rectangle();
             LinearGradientBrush stg = new LinearGradientBrush();
@@ -1084,7 +1461,9 @@ namespace SideDrawer
             stg.GradientStops.Add(Stop(Color.FromArgb(96, 0, 0, 0), 0));
             stg.GradientStops.Add(Stop(Color.FromArgb(30, 0, 0, 0), 0.18));
             stg.GradientStops.Add(Stop(Color.FromArgb(0, 0, 0, 0), 0.38));
+            stg.Freeze();
             scrimTop.Fill = stg;
+            scrimTop.IsHitTestVisible = false;
             _overlay.Children.Add(scrimTop);
 
             Rectangle scrimBottom = new Rectangle();
@@ -1093,19 +1472,10 @@ namespace SideDrawer
             sbg.EndPoint = new Point(0, 1);
             sbg.GradientStops.Add(Stop(Color.FromArgb(0, 0, 0, 0), 0.6));
             sbg.GradientStops.Add(Stop(Color.FromArgb(52, 0, 0, 0), 1));
+            sbg.Freeze();
             scrimBottom.Fill = sbg;
+            scrimBottom.IsHitTestVisible = false;
             _overlay.Children.Add(scrimBottom);
-
-            Rectangle noise = new Rectangle();
-            ImageBrush nb = new ImageBrush(MakeNoise(96, 96));
-            nb.TileMode = TileMode.Tile;
-            nb.Viewport = new Rect(0, 0, 96, 96);
-            nb.ViewportUnits = BrushMappingMode.Absolute;
-            noise.Fill = nb;
-
-
-
-
 
             Grid content = new Grid();
             content.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
@@ -1146,15 +1516,13 @@ namespace SideDrawer
             sv.VerticalScrollBarVisibility = ScrollBarVisibility.Hidden;
             sv.HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled;
             sv.PanningMode = PanningMode.VerticalOnly;
+            _homeScroll = sv;
             _homeCanvas = new Canvas();
             _homeCanvas.Margin = new Thickness(0, 0, 0, 0);
             _homeCanvas.HorizontalAlignment = HorizontalAlignment.Left;
             _homeCanvas.VerticalAlignment = VerticalAlignment.Top;
             sv.Content = _homeCanvas;
-            sv.PreviewMouseWheel += delegate(object s, MouseWheelEventArgs e)
-            {
-                Program.Log("WHEEL delta=" + e.Delta + " off=" + sv.VerticalOffset.ToString("0") + " svH=" + sv.ActualHeight.ToString("0") + " ext=" + sv.ExtentHeight.ToString("0") + " canvas=" + (_homeCanvas == null ? -1 : _homeCanvas.ActualHeight) + " h=" + (_homeCanvas == null ? -1 : _homeCanvas.Height) + " vis=" + (_homeCanvas == null ? "null" : _homeCanvas.Visibility.ToString()) + " kids=" + (_homeCanvas == null ? -1 : _homeCanvas.Children.Count));
-            };
+            _homeScroller = new SmoothScroller(sv);
             Grid.SetRow(sv, 1);
             _homePage.Children.Add(sv);
             // 固定底部装饰（第 3 行，不随滚动）
@@ -1164,9 +1532,9 @@ namespace SideDrawer
                 sF.HorizontalAlignment = HorizontalAlignment.Left;
                 sF.Margin = new Thickness(12, 3, 0, 3);
                 sF.IsHitTestVisible = false;
+                sF.CacheMode = Glass.MakeCache(this);
                 Grid.SetRow(sF, 2);
                 _homePage.Children.Add(sF);
-                Program.Log("STRIP F ok");
             }
             catch (Exception ex) { Program.Log("STRIP F fail " + ex.Message); }
 
@@ -1241,6 +1609,7 @@ namespace SideDrawer
             lqSpec.GradientStops.Add(new GradientStop(Color.FromArgb(8, 255, 255, 255), 0.28));
             lqSpec.GradientStops.Add(new GradientStop(Color.FromArgb(0, 255, 255, 255), 0.5));
             lqSpec.GradientStops.Add(new GradientStop(Color.FromArgb(16, 255, 255, 255), 0.78));
+            lqSpec.Freeze();
             spec.Fill = lqSpec;
             spec.IsHitTestVisible = false;
             liquid.Children.Add(spec);
@@ -1251,6 +1620,7 @@ namespace SideDrawer
             lqBot.EndPoint = new Point(0, 1);
             lqBot.GradientStops.Add(new GradientStop(Color.FromArgb(0, 255, 255, 255), 0.55));
             lqBot.GradientStops.Add(new GradientStop(Color.FromArgb(22, 255, 255, 255), 1));
+            lqBot.Freeze();
             bottomGlow.Fill = lqBot;
             bottomGlow.IsHitTestVisible = false;
             liquid.Children.Add(bottomGlow);
@@ -1270,6 +1640,7 @@ namespace SideDrawer
             rb2.GradientStops.Add(new GradientStop(Color.FromArgb(16, 255, 255, 255), 0.55));
             rb2.GradientStops.Add(new GradientStop(Color.FromArgb(40, 210, 230, 255), 0.82));
             rb2.GradientStops.Add(new GradientStop(Color.FromArgb(96, 255, 255, 255), 1));
+            rb2.Freeze();
             rim.BorderBrush = rb2;
             rim.IsHitTestVisible = false;
             _overlay.Children.Add(rim);
@@ -1289,14 +1660,18 @@ namespace SideDrawer
             vg.GradientStops.Add(new GradientStop(Color.FromArgb(0, 0, 0, 0), 0.52));
             vg.GradientStops.Add(new GradientStop(Color.FromArgb(120, 0, 0, 0), 0.78));
             vg.GradientStops.Add(new GradientStop(Color.FromArgb(255, 0, 0, 0), 1));
+            vg.Freeze();
             vignette.Fill = vg;
             vignette.IsHitTestVisible = false;
             Panel.SetZIndex(vignette, -50);   // 暗角只压玻璃底，不压文字/图标
+            _vignette = vignette;
+            _vignette.Visibility = _cfg.PanelBlur ? Visibility.Collapsed : Visibility.Visible;
             _overlay.Children.Add(vignette);
 
             try
             {
                 FrameworkElement frame = OrnateFrame.Create(_panelW, _panelH, 10, Color.FromRgb(0xFF, 0xA8, 0xC0), 0.92);
+                frame.CacheMode = Glass.MakeCache(this);
                 _overlay.Children.Add(frame);
 
             }
@@ -1492,6 +1867,7 @@ namespace SideDrawer
         {
             _tagOpen = -1;
             if (_tagPanel != null) _tagPanel.Visibility = Visibility.Collapsed;
+            if (_tagWin != null) { try { _tagWin.Hide(); } catch { } }
             RefreshTagRail();
         }
 
@@ -1512,29 +1888,50 @@ namespace SideDrawer
                 tagBg.GradientStops.Add(new GradientStop(Color.FromArgb(236, 255, 255, 255), 0));
                 tagBg.GradientStops.Add(new GradientStop(Color.FromArgb(214, 240, 242, 250), 0.6));
                 tagBg.GradientStops.Add(new GradientStop(Color.FromArgb(228, 246, 246, 252), 1));
+                tagBg.Freeze();
                 _tagPanel.Background = tagBg;
                 _tagPanel.BorderThickness = new Thickness(1);
                 _tagPanel.BorderBrush = new SolidColorBrush(ToArgb(46, 255, 255, 255));
-                DropShadowEffect tsh = new DropShadowEffect();
-                tsh.Color = Colors.Black;
-                tsh.BlurRadius = 30;
-                tsh.ShadowDepth = 0;
-                tsh.Opacity = 0.5;
-                _tagPanel.Effect = tsh;
                 _tagPanel.HorizontalAlignment = HorizontalAlignment.Left;
                 _tagPanel.VerticalAlignment = VerticalAlignment.Top;
-                _root.Children.Add(_tagPanel);
+
+                _tagWin = new Window();
+                _tagWin.WindowStyle = WindowStyle.None;
+                _tagWin.AllowsTransparency = true;
+                _tagWin.Background = Brushes.Transparent;
+                _tagWin.Topmost = true;
+                _tagWin.ShowInTaskbar = false;
+                _tagWin.ShowActivated = false;
+                _tagWin.ResizeMode = ResizeMode.NoResize;
+                _tagWin.WindowStartupLocation = WindowStartupLocation.Manual;
+                _tagWin.Title = "SideDrawerTag";
+                _tagWin.SourceInitialized += delegate
+                {
+                    IntPtr th = new WindowInteropHelper(_tagWin).Handle;
+                    int ex = Native.GetWindowLong(th, Native.GWL_EXSTYLE);
+                    Native.SetWindowLong(th, Native.GWL_EXSTYLE, ex | Native.WS_EX_TOOLWINDOW | Native.WS_EX_NOACTIVATE);
+                };
+                _tagWin.Content = _tagPanel;
             }
 
-            double musicLeft = _workArea.Width - 372 - 18;
+            double musicLeft = _workArea.Width - (MusicPanel.PW * MusicPanel.S) - 18;
             double gapW = musicLeft - _panelW - 44;
             if (gapW < 300) gapW = 300;
-            _tagPanel.Width = gapW;
-            _tagPanel.Height = _panelH * 2.0 / 3.0;
-            _tagPanel.Margin = new Thickness(_panelW + 22, 26, 0, 0);
             double clipH = _panelH * 2.0 / 3.0;
-            _tagPanel.Clip = new RectangleGeometry(new Rect(0, 0, gapW, clipH), 22, 22);
+            _tagPanel.Width = gapW;
+            _tagPanel.Height = clipH;
+            _tagPanel.Margin = new Thickness(0);
+            RectangleGeometry tgClip = new RectangleGeometry(new Rect(0, 0, gapW, clipH), 22, 22);
+            tgClip.Freeze();
+            _tagPanel.Clip = tgClip;
             _tagW = gapW - 40;
+            if (_tagWin != null)
+            {
+                _tagWin.Left = _workArea.Left + _panelW + 22;
+                _tagWin.Top = _workArea.Top + 26;
+                _tagWin.Width = gapW;
+                _tagWin.Height = clipH;
+            }
 
 
             Grid shell = new Grid();
@@ -1597,13 +1994,20 @@ namespace SideDrawer
             _tagCanvas.HorizontalAlignment = HorizontalAlignment.Left;
             _tagCanvas.VerticalAlignment = VerticalAlignment.Top;
             sv.Content = _tagCanvas;
+            if (_tagScroller != null) _tagScroller.Stop();
             _tagScroll = sv;
+            _tagScroller = new SmoothScroller(sv);
             Grid.SetRow(sv, 1);
             shell.Children.Add(sv);
 
             _tagPanel.Child = shell;
 
             _tagPanel.Visibility = Visibility.Visible;
+            if (_tagWin != null)
+            {
+                if (!_tagWin.IsVisible) _tagWin.Show();
+                try { Native.KeepTopmost(new WindowInteropHelper(_tagWin).Handle); } catch { }
+            }
             RebuildTagTiles(index);
         }
 
@@ -2016,13 +2420,26 @@ namespace SideDrawer
                 bg.GradientStops[1].Color = Color.FromArgb(110, 255, 255, 255);
                 bg.GradientStops[2].Color = Color.FromArgb(64, 255, 255, 255);
             };
+            bool envDown = false;
+            g.MouseLeftButtonDown += delegate(object s, MouseButtonEventArgs e)
+            {
+                e.Handled = true;
+                envDown = true;
+            };
             g.MouseLeave += delegate
             {
+                envDown = false;
                 bg.GradientStops[0].Color = Color.FromArgb(80, 255, 255, 255);
                 bg.GradientStops[1].Color = Color.FromArgb(150, 255, 255, 255);
                 bg.GradientStops[2].Color = Color.FromArgb(90, 255, 255, 255);
             };
-            g.MouseLeftButtonUp += delegate(object s, MouseButtonEventArgs e) { e.Handled = true; CloseDrawer(); };
+            g.MouseLeftButtonUp += delegate(object s, MouseButtonEventArgs e)
+            {
+                e.Handled = true;
+                if (!envDown) return;
+                envDown = false;
+                CloseDrawer();
+            };
             return g;
         }
         private Border BuildNub()
@@ -2063,8 +2480,6 @@ namespace SideDrawer
             _clock.FontWeight = FontWeights.Bold;
             _clock.Foreground = new SolidColorBrush(Color.FromArgb(255, 16, 16, 16));
             _clock.Text = "--:--";
-            
-            TextShadow(_clock);
             TextShadow(_clock);
             left.Children.Add(_clock);
 
@@ -2074,7 +2489,6 @@ namespace SideDrawer
             _date.FontWeight = FontWeights.Medium;
             _date.Margin = new Thickness(3, 0, 0, 0);
             _date.Foreground = new SolidColorBrush(Color.FromArgb(235, 56, 56, 56));
-            TextShadow(_date);
             TextShadow(_date);
             left.Children.Add(_date);
 
@@ -2149,14 +2563,22 @@ namespace SideDrawer
             return b;
         }
 
-        private static void TextShadow(TextBlock t)
+        private static readonly DropShadowEffect _sharedTextShadow = MakeTextShadow();
+
+        private static DropShadowEffect MakeTextShadow()
         {
             DropShadowEffect e = new DropShadowEffect();
             e.Color = Color.FromRgb(8, 8, 12);
             e.BlurRadius = 1.1;
             e.ShadowDepth = 0;
             e.Opacity = 1.0;
-            t.Effect = e;
+            e.Freeze();
+            return e;
+        }
+
+        private static void TextShadow(TextBlock t)
+        {
+            t.Effect = _sharedTextShadow;
         }
 
         private int BlurRadius()
@@ -2376,15 +2798,14 @@ namespace SideDrawer
 
             TextBlock t = new TextBlock();
             t.Text = title;
-            t.FontFamily = new FontFamily("Candara, Microsoft YaHei UI");
-            t.Foreground = new SolidColorBrush(Color.FromArgb(240, 38, 38, 38));
-            TextShadow(t);
+            t.FontFamily = _tileFont;
+            t.Foreground = FreezeBrush(Color.FromArgb(230, 34, 34, 38));
             sp.Children.Add(t);
 
             big = new TextBlock();
             big.FontFamily = _clockFont;
             big.FontSize = 27 * _uiScale;
-            big.Foreground = new SolidColorBrush(Color.FromArgb(255, 12, 12, 12));
+            big.Foreground = FreezeBrush(Color.FromArgb(255, 12, 12, 12));
             big.Margin = new Thickness(0, 1 * _uiScale, 0, 6 * _uiScale);
             
             sp.Children.Add(big);
@@ -2392,16 +2813,14 @@ namespace SideDrawer
             bar = new Grid();
             bar.Height = 5;
             Border track = new Border();
-            track.Background = new SolidColorBrush(Color.FromArgb(46, 60, 60, 80));
-            track.Background = new SolidColorBrush(Color.FromArgb(40, 255, 255, 255));
+            track.Background = FreezeBrush(Color.FromArgb(40, 255, 255, 255));
             bar.Children.Add(track);
 
             Grid fillGrid = new Grid();
             fillGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(0.5, GridUnitType.Star) });
             fillGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(0.5, GridUnitType.Star) });
             Border fill = new Border();
-            fill.Background = new SolidColorBrush(Color.FromArgb(215, 90, 110, 170));
-            fill.Background = new SolidColorBrush(Color.FromArgb(190, 255, 255, 255));
+            fill.Background = FreezeBrush(Color.FromArgb(190, 255, 255, 255));
             Grid.SetColumn(fill, 0);
             fillGrid.Children.Add(fill);
             bar.Children.Add(fillGrid);
@@ -2409,10 +2828,9 @@ namespace SideDrawer
             sp.Children.Add(bar);
 
             sub = new TextBlock();
-            sub.FontFamily = new FontFamily("Candara, Microsoft YaHei UI");
+            sub.FontFamily = _tileFont;
             sub.FontSize = 10.5 * _uiScale;
-            sub.Foreground = new SolidColorBrush(Color.FromArgb(225, 52, 52, 52));
-            TextShadow(sub);
+            sub.Foreground = FreezeBrush(Color.FromArgb(215, 42, 42, 48));
             sp.Children.Add(sub);
             return sp;
         }
@@ -2423,22 +2841,32 @@ namespace SideDrawer
             ratio = Math.Max(0.02, Math.Min(1.0, ratio));
             Grid fillGrid = bar.Tag as Grid;
             if (fillGrid == null) return;
+            double cur = fillGrid.ColumnDefinitions[0].Width.Value;
+            if (Math.Abs(cur - ratio) < 0.005) return;
             fillGrid.ColumnDefinitions[0].Width = new GridLength(ratio, GridUnitType.Star);
             fillGrid.ColumnDefinitions[1].Width = new GridLength(1 - ratio, GridUnitType.Star);
         }
 
         private void UpdateWidgets()
         {
+            RequestWidgetsUpdate();
+        }
+
+        /// <summary>内存与 CPU 轻量即时更新；耗时的 GPU PerformanceCounter 全部放后台线程执行，零主线程卡顿。</summary>
+        private void RequestWidgetsUpdate()
+        {
             try
             {
                 Native.MEMORYSTATUSEX ms = new Native.MEMORYSTATUSEX();
                 ms.dwLength = (uint)Marshal.SizeOf(typeof(Native.MEMORYSTATUSEX));
-                if (Native.GlobalMemoryStatusEx(ref ms) && ms.ullTotalPhys > 0)
+                if (Native.GlobalMemoryStatusEx(ref ms) && ms.ullTotalPhys > 0 && _memPct != null)
                 {
                     double total = ms.ullTotalPhys / 1073741824.0;
                     double used = (ms.ullTotalPhys - ms.ullAvailPhys) / 1073741824.0;
-                    _memPct.Text = ms.dwMemoryLoad + "%";
-                    _memSub.Text = string.Format("已用 {0:0.0} / {1:0.0} GB", used, total);
+                    string pctTxt = ms.dwMemoryLoad + "%";
+                    string subTxt = string.Format("已用 {0:0.0} / {1:0.0} GB", used, total);
+                    if (_memPct.Text != pctTxt) _memPct.Text = pctTxt;
+                    if (_memSub.Text != subTxt) _memSub.Text = subTxt;
                     SetBar(_memBar, ms.dwMemoryLoad / 100.0);
                 }
             }
@@ -2457,36 +2885,59 @@ namespace SideDrawer
                     _prevIdle = idle; _prevKernel = kernel; _prevUser = user;
                     if (_cpuPct != null)
                     {
-                        _cpuPct.Text = (pct * 100).ToString("0") + "%";
-                        _cpuSub.Text = CpuName();
+                        string cpuTxt = (pct * 100).ToString("0") + "%";
+                        string cpuNm = CpuName();
+                        if (_cpuPct.Text != cpuTxt) _cpuPct.Text = cpuTxt;
+                        if (_cpuSub.Text != cpuNm) _cpuSub.Text = cpuNm;
                         SetBar(_cpuBar, pct);
                     }
                 }
             }
             catch { }
-            try
+
+            if (_gpuPct == null) return;
+            // 先把上次结果立刻刷到界面（切换单/双卡模式时立即可见）
+            if (_gpuLast != null && _gpuLast[0] >= 0) ApplyGpuUi(_gpuLast);
+
+            if (Interlocked.Exchange(ref _widgetBusy, 1) != 0) return;
+            ThreadPool.QueueUserWorkItem(delegate
             {
-                if (_gpuPct != null)
+                double[] gpus = null;
+                try { gpus = GpuUsages(); }
+                catch { }
+                finally { Interlocked.Exchange(ref _widgetBusy, 0); }
+                if (gpus == null) return;
+                try
                 {
-                    double[] gpus = GpuUsages();
-                    bool dual = _cfg.GpuMode == 1 || (_cfg.GpuMode == 0 && gpus[1] >= 0);   // 0=自动 1=双卡 2=单卡
-                    double g0 = gpus[0];
-                    double g1 = gpus[1];
-                    if (dual && g1 >= 0)
+                    Dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(delegate
                     {
-                        _gpuPct.Text = g0.ToString("0") + "% / " + g1.ToString("0") + "%";
-                        _gpuSub.Text = "双显卡 1 / 2";
-                        SetBar(_gpuBar, g0 / 100.0);
-                    }
-                    else
-                    {
-                        _gpuPct.Text = g0.ToString("0") + "%";
-                        _gpuSub.Text = "显卡占用";
-                        SetBar(_gpuBar, g0 / 100.0);
-                    }
+                        if (_gpuPct != null) ApplyGpuUi(gpus);
+                    }));
                 }
+                catch { }
+            });
+        }
+
+        private void ApplyGpuUi(double[] gpus)
+        {
+            if (_gpuPct == null || gpus == null || gpus.Length < 2) return;
+            double g0 = gpus[0] < 0 ? 0 : gpus[0];
+            double g1 = gpus[1];
+            bool dual = _cfg.GpuMode == 1 || (_cfg.GpuMode == 0 && g1 >= 0);   // 0=自动 1=双卡 2=单卡
+            string pctTxt, subTxt;
+            if (dual && g1 >= 0)
+            {
+                pctTxt = g0.ToString("0") + "% / " + g1.ToString("0") + "%";
+                subTxt = "双显卡 1 / 2";
             }
-            catch { }
+            else
+            {
+                pctTxt = g0.ToString("0") + "%";
+                subTxt = "显卡占用";
+            }
+            if (_gpuPct.Text != pctTxt) _gpuPct.Text = pctTxt;
+            if (_gpuSub.Text != subTxt) _gpuSub.Text = subTxt;
+            SetBar(_gpuBar, g0 / 100.0);
         }
 
         private static string _cpuName;
@@ -2517,58 +2968,83 @@ namespace SideDrawer
             return _cpuName;
         }
 
-        private static System.Diagnostics.PerformanceCounter[] _gpuCounters;
-        private static string[] _gpuKeys;
-        private static DateTime _gpuStamp = DateTime.MinValue;
+        private static readonly object _gpuLock = new object();
+        private static System.Diagnostics.PerformanceCounterCategory _gpuCat;
+        private static Dictionary<string, System.Diagnostics.CounterSample> _gpuPrevSamples;
         private static double[] _gpuLast = new double[] { -1, -1 };
 
-        /// <summary>按适配器（LUID）分组统计 GPU 占用，最多返回 2 个。</summary>
+        private static void DisposeGpuCounters()
+        {
+            lock (_gpuLock)
+            {
+                _gpuPrevSamples = null;
+                _gpuCat = null;
+            }
+        }
+
+        /// <summary>按适配器（LUID）分组统计 GPU 占用（复用 Category + 单次 ReadCategory 批量采样，无句柄泄漏，仅在后台线程调用）。</summary>
         private static double[] GpuUsages()
         {
-            try
+            lock (_gpuLock)
             {
-                if (_gpuCounters == null || (DateTime.Now - _gpuStamp).TotalSeconds > 30)
+                try
                 {
-                    _gpuStamp = DateTime.Now;
-                    List<System.Diagnostics.PerformanceCounter> list = new List<System.Diagnostics.PerformanceCounter>();
-                    List<string> keys = new List<string>();
-                    System.Diagnostics.PerformanceCounterCategory cat = new System.Diagnostics.PerformanceCounterCategory("GPU Engine");
-                    foreach (string inst in cat.GetInstanceNames())
+                    if (_gpuCat == null) _gpuCat = new System.Diagnostics.PerformanceCounterCategory("GPU Engine");
+                    System.Diagnostics.InstanceDataCollectionCollection idcc = _gpuCat.ReadCategory();
+                    if (idcc == null || !idcc.Contains("Utilization Percentage")) return _gpuLast;
+                    System.Diagnostics.InstanceDataCollection col = idcc["Utilization Percentage"];
+                    if (col == null) return _gpuLast;
+
+                    Dictionary<string, System.Diagnostics.CounterSample> next = new Dictionary<string, System.Diagnostics.CounterSample>(StringComparer.OrdinalIgnoreCase);
+                    Dictionary<string, double> sums = new Dictionary<string, double>();
+
+                    foreach (System.Collections.DictionaryEntry de in col)
                     {
-                        if (inst.IndexOf("engtype_3D", StringComparison.OrdinalIgnoreCase) < 0) continue;
-                        list.Add(new System.Diagnostics.PerformanceCounter("GPU Engine", "Utilization Percentage", inst, true));
-                        keys.Add(AdapterKey(inst));
+                        System.Diagnostics.InstanceData id = de.Value as System.Diagnostics.InstanceData;
+                        if (id == null) continue;
+                        string inst = id.InstanceName;
+                        if (string.IsNullOrEmpty(inst) || inst.IndexOf("engtype_3D", StringComparison.OrdinalIgnoreCase) < 0) continue;
+
+                        System.Diagnostics.CounterSample cur = id.Sample;
+                        next[inst] = cur;
+
+                        string k = AdapterKey(inst);
+                        if (!sums.ContainsKey(k)) sums[k] = 0;
+
+                        System.Diagnostics.CounterSample prev;
+                        if (_gpuPrevSamples != null && _gpuPrevSamples.TryGetValue(inst, out prev))
+                        {
+                            double v = 0;
+                            try { v = System.Diagnostics.CounterSample.Calculate(prev, cur); } catch { v = 0; }
+                            if (v > 0 && !double.IsNaN(v) && !double.IsInfinity(v)) sums[k] += v;
+                        }
                     }
-                    _gpuCounters = list.ToArray();
-                    _gpuKeys = keys.ToArray();
-                }
 
-                Dictionary<string, double> sums = new Dictionary<string, double>();
-                for (int i = 0; i < _gpuCounters.Length; i++)
-                {
-                    double v = 0;
-                    try { v = _gpuCounters[i].NextValue(); } catch { continue; }
-                    string k = _gpuKeys[i];
-                    if (!sums.ContainsKey(k)) sums[k] = 0;
-                    sums[k] += v;
-                }
+                    bool firstSample = (_gpuPrevSamples == null);
+                    _gpuPrevSamples = next;
+                    if (firstSample)
+                    {
+                        Thread.Sleep(220);
+                        return GpuUsages();
+                    }
 
-                List<double> vals = new List<double>();
-                foreach (KeyValuePair<string, double> kv in sums)
-                {
-                    double v = kv.Value;
-                    if (v < 0) v = 0;
-                    if (v > 100) v = 100;
-                    vals.Add(v);
-                }
-                vals.Sort();
-                vals.Reverse();
+                    List<double> vals = new List<double>();
+                    foreach (KeyValuePair<string, double> kv in sums)
+                    {
+                        double v = kv.Value;
+                        if (v < 0) v = 0;
+                        if (v > 100) v = 100;
+                        vals.Add(v);
+                    }
+                    vals.Sort();
+                    vals.Reverse();
 
-                double[] result = new double[] { vals.Count > 0 ? vals[0] : 0, vals.Count > 1 ? vals[1] : -1 };
-                _gpuLast = result;
-                return result;
+                    double[] result = new double[] { vals.Count > 0 ? vals[0] : 0, vals.Count > 1 ? vals[1] : -1 };
+                    _gpuLast = result;
+                    return result;
+                }
+                catch { return _gpuLast; }
             }
-            catch { return _gpuLast; }
         }
 
         /// <summary>从 GPU Engine 实例名里取适配器标识（luid_..._phys_N）。</summary>
@@ -2895,6 +3371,45 @@ namespace SideDrawer
             ConfigStore.Save(_cfg);
             RebuildTiles();
         }
+        private static readonly SolidColorBrush _cardBgBrush = FreezeBrush(Color.FromArgb(118, 255, 255, 255));
+        private static readonly SolidColorBrush _cardBorderBrush = FreezeBrush(Color.FromArgb(150, 255, 255, 255));
+        private static readonly SolidColorBrush _groupTitleBrush = FreezeBrush(Color.FromArgb(255, 20, 20, 24));
+        private static readonly SolidColorBrush _groupCntBrush = FreezeBrush(Color.FromArgb(225, 46, 46, 52));
+        private static readonly SolidColorBrush _togBgBrush = FreezeBrush(Color.FromArgb(232, 58, 58, 72));
+        private static readonly SolidColorBrush _togBorderBrush = FreezeBrush(Color.FromArgb(190, 255, 255, 255));
+        private static readonly SolidColorBrush _togStrokeBrush = FreezeBrush(Color.FromArgb(240, 255, 255, 255));
+        private static readonly Geometry _chevUpGeo = FreezeGeo("M0,5 L5,0 L10,5");
+        private static readonly Geometry _chevDownGeo = FreezeGeo("M0,0 L5,5 L10,0");
+
+        private static Geometry FreezeGeo(string path)
+        {
+            Geometry g = Geometry.Parse(path);
+            g.Freeze();
+            return g;
+        }
+
+        private bool _iconWarmupStarted;
+        private void StartIconWarmupOnce()
+        {
+            if (_iconWarmupStarted || _cfg == null) return;
+            _iconWarmupStarted = true;
+            List<string> all = new List<string>();
+            if (_cfg.Groups != null)
+            {
+                foreach (GroupDef g in _cfg.Groups)
+                {
+                    if (g.Items != null)
+                        foreach (string p in g.Items) all.Add(p);
+                }
+            }
+            if (_cfg.Pins != null)
+            {
+                foreach (ItemCfg ic in _cfg.Pins)
+                    if (!string.IsNullOrEmpty(ic.Path)) all.Add(ic.Path);
+            }
+            IconCache.WarmupAsync(all);
+        }
+
         private void RebuildGrouped()
         {
             _homeCanvas.Children.Clear();
@@ -2915,8 +3430,8 @@ namespace SideDrawer
                 cardBg.Width = _panelW - 52;
                 cardBg.Height = cardH;
                 cardBg.CornerRadius = new CornerRadius(20);
-                cardBg.Background = new SolidColorBrush(Color.FromArgb(118, 255, 255, 255));
-                cardBg.BorderBrush = new SolidColorBrush(Color.FromArgb(150, 255, 255, 255));
+                cardBg.Background = _cardBgBrush;
+                cardBg.BorderBrush = _cardBorderBrush;
                 cardBg.BorderThickness = new Thickness(1);
                 cardBg.IsHitTestVisible = false;
                 Canvas.SetLeft(cardBg, 26);
@@ -2952,17 +3467,15 @@ namespace SideDrawer
                 title.FontFamily = _clockFont;
                 title.FontSize = 17 * _uiScale;
                 title.FontWeight = FontWeights.Bold;
-                title.Foreground = new SolidColorBrush(Color.FromArgb(255, 20, 20, 20));
-                TextShadow(title);
+                title.Foreground = _groupTitleBrush;
                 nameRow.Children.Add(title);
 
                 TextBlock cnt = new TextBlock();
                 cnt.Text = "  " + g.Items.Count;
-                cnt.FontFamily = new FontFamily("Candara, Microsoft YaHei UI");
+                cnt.FontFamily = _tileFont;
                 cnt.FontSize = 11 * _uiScale;
                 cnt.VerticalAlignment = VerticalAlignment.Center;
-                cnt.Foreground = new SolidColorBrush(Color.FromArgb(235, 46, 46, 46));
-                TextShadow(cnt);
+                cnt.Foreground = _groupCntBrush;
                 nameRow.Children.Add(cnt);
                 head.Children.Add(nameRow);
                 nameRow.Background = Brushes.Transparent;
@@ -2978,14 +3491,14 @@ namespace SideDrawer
                 tog.Width = 40 * _uiScale;
                 tog.Height = 22 * _uiScale;
                 tog.CornerRadius = new CornerRadius(11 * _uiScale);
-                tog.Background = new SolidColorBrush(Color.FromArgb(232, 58, 58, 72));
-                tog.BorderBrush = new SolidColorBrush(Color.FromArgb(190, 255, 255, 255));
+                tog.Background = _togBgBrush;
+                tog.BorderBrush = _togBorderBrush;
                 tog.BorderThickness = new Thickness(1);
                 tog.Cursor = Cursors.Hand;
 
                 System.Windows.Shapes.Path chev = new System.Windows.Shapes.Path();
-                chev.Data = System.Windows.Media.Geometry.Parse(g.Expanded ? "M0,5 L5,0 L10,5" : "M0,0 L5,5 L10,0");
-                chev.Stroke = new SolidColorBrush(Color.FromArgb(240, 255, 255, 255));
+                chev.Data = g.Expanded ? _chevUpGeo : _chevDownGeo;
+                chev.Stroke = _togStrokeBrush;
                 chev.StrokeThickness = 1.7;
                 chev.StrokeStartLineCap = PenLineCap.Round;
                 chev.StrokeEndLineCap = PenLineCap.Round;
@@ -3019,7 +3532,7 @@ namespace SideDrawer
                 for (int i = 0; i < shown; i++)
                 {
                     string path = itemList[i];
-                    if (!ConfigStore.Alive(path)) continue;
+                    if (!IconCache.Has(path) && !ConfigStore.Alive(path)) continue;
                     Item it = new Item();
                     it.Name = IOPath.GetFileNameWithoutExtension(path);
                     it.Path = path;
@@ -3034,15 +3547,12 @@ namespace SideDrawer
                 y += cardH + 6;
             }
 
-
-
-
-
             _homeCanvas.Height = Math.Max(220, y + 20);   // 让 ScrollViewer 有可滚动范围
-
+            StartIconWarmupOnce();
         }
         private void RebuildTiles()
         {
+            if (_homeScroller != null) _homeScroller.Stop();
             // 首次运行导入桌面 + 开始菜单（分组模式也要跑）
             if (!_imported && _homeCanvas != null) { _imported = true; ImportDesktopShortcuts(); }
             if (_cfg.Groups.Count > 0) { RebuildGrouped(); return; }
@@ -3282,6 +3792,31 @@ namespace SideDrawer
             ConfigStore.Save(_cfg);
             RebuildTiles();
         }
+        private static readonly FontFamily _tileFont = new FontFamily("Candara, Microsoft YaHei UI");
+        private static readonly SolidColorBrush _tileTextBrush = FreezeBrush(Color.FromArgb(248, 16, 16, 20));
+        private static readonly SolidColorBrush _tileHoverBrush = FreezeBrush(Color.FromArgb(36, 255, 255, 255));
+        private static readonly Dictionary<double, RectangleGeometry> _iconClipCache = new Dictionary<double, RectangleGeometry>();
+
+        private static RectangleGeometry GetIconClip(double sz)
+        {
+            double key = Math.Round(sz, 1);
+            RectangleGeometry g;
+            if (!_iconClipCache.TryGetValue(key, out g))
+            {
+                g = new RectangleGeometry(new Rect(0, 0, sz, sz), sz * 0.22, sz * 0.22);
+                g.Freeze();
+                _iconClipCache[key] = g;
+            }
+            return g;
+        }
+
+        private static SolidColorBrush FreezeBrush(Color c)
+        {
+            SolidColorBrush b = new SolidColorBrush(c);
+            b.Freeze();
+            return b;
+        }
+
         private FrameworkElement BuildTile(Item it)
         {
             int span = it.Span < 1 ? 1 : (it.Span > 3 ? 3 : it.Span);
@@ -3308,34 +3843,37 @@ namespace SideDrawer
                 im.Width = sz;
                 im.Height = sz;
                 im.Stretch = Stretch.Uniform;
-                // 图标统一圆角（约 22%）
-                im.Clip = new RectangleGeometry(new Rect(0, 0, sz, sz), sz * 0.22, sz * 0.22);
+                im.SnapsToDevicePixels = true;
+                im.UseLayoutRounding = true;
+                // 图标统一圆角（约 22%），按尺寸复用冻结几何体
+                im.Clip = GetIconClip(sz);
                 RenderOptions.SetBitmapScalingMode(im, BitmapScalingMode.HighQuality);
                 sp.Children.Add(im);
             }
 
             TextBlock tb = new TextBlock();
             tb.Text = it.Name;
-            tb.FontFamily = new FontFamily("Candara, Microsoft YaHei UI");
-            tb.Foreground = new SolidColorBrush(Color.FromArgb(248, 18, 18, 18));
-            TextShadow(tb);
-            tb.Foreground = new SolidColorBrush(Color.FromArgb(248, 18, 18, 18));
-            TextShadow(tb);
+            tb.FontFamily = _tileFont;
+            tb.Foreground = _tileTextBrush;
             tb.TextAlignment = TextAlignment.Center;
             tb.TextTrimming = TextTrimming.CharacterEllipsis;
             tb.Width = tw - 6;
             tb.Margin = new Thickness(0, 7, 0, 1);
             sp.Children.Add(tb);
 
+            // 不再给图标格套 BitmapCache 与黑字黑阴影：
+            // 1) 直接由 WPF 原生高 DPI 渲染矢量字与高清图标，彻底消除离屏缩放发虚；
+            // 2) 省掉 110+ 个 DropShadowEffect 着色器与 110+ 张离屏 GPU 纹理，显存和滚动更轻快。
             b.Child = sp;
             b.Tag = it;
 
-            b.MouseEnter += delegate { b.Background = new SolidColorBrush(Color.FromArgb(36, 255, 255, 255)); };
+            b.MouseEnter += delegate { b.Background = _tileHoverBrush; };
             b.MouseLeave += delegate { b.Background = Brushes.Transparent; };
 
             Item captured = it;
             b.MouseLeftButtonDown += delegate(object s, MouseButtonEventArgs e)
             {
+                if (_busy || !_open) return;
                 // 文件夹页交给 _folderWrap 的拖拽逻辑，不拦截事件
                 if (_inFolderPage) return;
                 e.Handled = true;
@@ -3364,6 +3902,11 @@ namespace SideDrawer
                 e.Handled = true;
                 b.ReleaseMouseCapture();
                 b.Opacity = 1;
+                bool pressedHere = _inFolderPage ? (_fTile == b) : (_dragTile == b);
+                if (!pressedHere || _busy || !_open)
+                {
+                    return;
+                }
                 if (_dragging)
                 {
                     _dragging = false;
@@ -3720,13 +4263,95 @@ namespace SideDrawer
             _closeTimer.Stop();
         }
 
-        /// <summary>捕获层可见性：点击外部收回 或 菜单打开时启用。</summary>
+        /// <summary>外部点击监听：点击外部收回 或 菜单打开时启用（不再需要全屏透明窗口）。</summary>
         private void UpdateClickCatcher()
         {
-            if (_clickCatcher == null) return;
+            if (_outsideTimer == null) return;
             bool need = _open && (_cfg.CloseOnOutside || _menuOpen);
-            _clickCatcher.Visibility = need ? Visibility.Visible : Visibility.Collapsed;
+            if (need)
+            {
+                _outsidePrevDown = Native.IsAnyMouseButtonDown();
+                if (!_outsideTimer.IsEnabled) _outsideTimer.Start();
+            }
+            else
+            {
+                _outsideTimer.Stop();
+            }
         }
+
+        private void StartDrawerSlide(double fromX, double toX, double durMs, bool opening, int gen)
+        {
+            _slideFromX = fromX;
+            _slideToX = toX;
+            _slideDurMs = durMs;
+            _slideOpening = opening;
+            _slideGen = gen;
+            _sliding = true;
+
+            int fromPx = (int)Math.Round(fromX * _dpiX);
+            int toPx = (int)Math.Round(toX * _dpiX);
+            int yPx = (int)Math.Round(_workArea.Top * _dpiY);
+            IntPtr h = _hwnd;
+
+            DwmGlass.SlideHorizontalAsync(
+                h, fromPx, toPx, yPx, durMs, opening,
+                delegate { return gen != _animGen || !_sliding; },
+                delegate(int frames, double totalMs)
+                {
+                    try
+                    {
+                        Dispatcher.BeginInvoke(DispatcherPriority.Send, new Action(delegate
+                        {
+                            if (gen != _animGen) return;
+                            _sliding = false;
+                            if (Environment.GetEnvironmentVariable("SIDEDRAWER_FPS") == "1")
+                            {
+                                Program.Log(string.Format("SLIDE {0}: frames={1} dur={2:0}ms avg={3:0.0}fps",
+                                    opening ? "open" : "close", frames, totalMs, totalMs > 1 ? frames * 1000.0 / totalMs : 0));
+                            }
+                            if (opening)
+                            {
+                                Left = toX;
+                                _busy = false;
+                                _panelHost.CacheMode = null;
+                                _panelHost.IsHitTestVisible = true;
+                                StopFpsProbe();
+                                if (_open)
+                                {
+                                    UpdateClickCatcher();
+                                    if (_clockTimer != null && !_clockTimer.IsEnabled) _clockTimer.Start();
+                                    if (_topTimer != null && !_topTimer.IsEnabled) _topTimer.Start();
+                                    RequestWidgetsUpdate();
+                                    PruneMissingItemsAsync();
+                                }
+                            }
+                            else
+                            {
+                                _busy = false;
+                                _open = false;
+                                StopFpsProbe();
+                                ApplyClosedBounds();
+                                UpdateClickCatcher();
+                            }
+                        }));
+                    }
+                    catch { }
+                });
+        }
+
+        private void StopDrawerSlide()
+        {
+            _sliding = false;
+        }
+
+        private void PositionDrawerAndEnv(double xDip)
+        {
+            int xPx = (int)Math.Round(xDip * _dpiX);
+            int yPx = (int)Math.Round(_workArea.Top * _dpiY);
+            if (_hwnd != IntPtr.Zero) DwmGlass.MovePx(_hwnd, xPx, yPx);
+            else Left = xDip;
+        }
+
         public void Open()
         {
             if (_open || _busy) return;
@@ -3737,81 +4362,125 @@ namespace SideDrawer
             catch (Exception ex) { Program.Log("Open failed: " + ex); _busy = false; }
         }
 
+        private void StartFpsProbe(string tag)
+        {
+            if (Environment.GetEnvironmentVariable("SIDEDRAWER_FPS") != "1") return;
+            StopFpsProbe();
+            _fpsTag = tag;
+            _fpsFrames = 0;
+            _fpsWorstMs = 0;
+            _fpsStartTicks = Stopwatch.GetTimestamp();
+            _fpsLastTicks = _fpsStartTicks;
+            _fpsHooked = true;
+            CompositionTarget.Rendering += OnFpsTick;
+        }
+
+        private void OnFpsTick(object sender, EventArgs e)
+        {
+            long now = Stopwatch.GetTimestamp();
+            double gapMs = (now - _fpsLastTicks) * 1000.0 / Stopwatch.Frequency;
+            _fpsLastTicks = now;
+            if (_fpsFrames > 0 && gapMs > _fpsWorstMs) _fpsWorstMs = gapMs;
+            _fpsFrames++;
+        }
+
+        private void StopFpsProbe()
+        {
+            if (!_fpsHooked) return;
+            _fpsHooked = false;
+            CompositionTarget.Rendering -= OnFpsTick;
+            double sec = (Stopwatch.GetTimestamp() - _fpsStartTicks) / (double)Stopwatch.Frequency;
+            double avg = sec > 0.001 ? _fpsFrames / sec : 0;
+            Program.Log(string.Format("FPS {0}: frames={1} dur={2:0}ms avg={3:0.0}fps worstGap={4:0.0}ms",
+                _fpsTag, _fpsFrames, sec * 1000.0, avg, _fpsWorstMs));
+        }
+
         private void OpenCore()
         {
             if (_tab != null) _tab.HideNow();
-            ApplyOpenBounds();
-            Show();
-            UpdateClickCatcher();
-            Native.KeepTopmost(new WindowInteropHelper(this).Handle);
+            int gen = ++_animGen;
+            // 多退 24px 到屏幕外，确保 Show() 时连右侧阴影也完全在屏外，杜绝左边缘白闪
+            double startX = _workArea.Left - _panelW - 24;
+            Left = startX;
+            Top = _workArea.Top;
+            Width = _panelW;
+            Height = _panelH;
+            _shift.BeginAnimation(TranslateTransform.XProperty, null);
+            _shift.X = 0;
+            _overlay.BeginAnimation(UIElement.OpacityProperty, null);
+            _overlay.Opacity = 1;
+            _panelHost.BeginAnimation(UIElement.OpacityProperty, null);
+            _panelHost.Opacity = 1;
+            _panelHost.IsHitTestVisible = false;   // 滑出动画期间禁用面板内点击，彻底杜绝误触图标
+
+            if (_hwnd != IntPtr.Zero)
+                DwmGlass.MovePx(_hwnd, (int)Math.Round(startX * _dpiX), (int)Math.Round(_workArea.Top * _dpiY));
+            if (!IsVisible) Show();
+            RefreshDpi();
+            if (_hwnd == IntPtr.Zero) _hwnd = new WindowInteropHelper(this).Handle;
+            DwmGlass.MovePx(_hwnd, (int)Math.Round(startX * _dpiX), (int)Math.Round(_workArea.Top * _dpiY));
+            try { Native.KeepTopmost(_hwnd); } catch { }
+            if (_vignette != null)
+                _vignette.Visibility = _cfg.PanelBlur ? Visibility.Collapsed : Visibility.Visible;
+            UpdateClock();
+
             if (_cfg.MusicPanel && _music != null)
             {
-                Rect wa2 = _workArea;
-            _music.SetVeil(VeilAlpha() + 10);
-                double mx = Math.Max(0, ActualWidth - (MusicPanel.PW * MusicPanel.S) - 18);
-                _music.SetPos(mx, 26);
-                _music.Show(mx, 26, this);   // 和侧边栏同时弹出
-                Program.Log("music show vis=" + _music.Visibility + " w=" + Width + " aw=" + ActualWidth + " root=" + _root.ActualWidth + " tabActual=" + (PresentationSource.FromVisual(this) != null));
+                _music.SetVeil(VeilAlpha() + 10);
+                double mx = Math.Max(0, _workArea.Left + _workArea.Width - (MusicPanel.PW * MusicPanel.S) - 18);
+                _music.Show(mx, _workArea.Top + 26, this);   // 独立原生实时模糊玻璃窗，和侧边栏同时弹出
             }
 
-            // 先用缓存/底色立即开始滑动，玻璃在动画开始后再算（避免开面板时卡住）
-            if (true)
-            {
-                _glass.Background = FixedBackdrop();   // 固定底色，不随背后窗口变化
-            }
-            {
-                double specL = 12, specT = _panelH - 176;
-            }
-            _specWantShow = true;
-
-            _specWantTop = _panelH - 176;
             try { RefreshGlass(); } catch { }
-            if (_glassTimer == null)
+
+            // 窗口本身由独立高精度线程驱动 DWM GPU 平移，WPF 无需每帧重绘
+            _panelHost.CacheMode = null;
+            UpdateLayout();
+            StartFpsProbe("open");
+            if (!_everOpened)
             {
-                _glassTimer = new DispatcherTimer();
-                _glassTimer.Interval = TimeSpan.FromMilliseconds(700);
-                _glassTimer.Tick += delegate
+                _everOpened = true;
+                // 冷启动首次打开：等 1 帧让 WPF 提交 1024x1104 D3D 交换链后再滑出，避免首次空框
+                Dispatcher.BeginInvoke(DispatcherPriority.Render, new Action(delegate
                 {
-                    if (!_open || _busy) return;
-                    try { RefreshGlass(); } catch { }
-                };
+                    if (gen != _animGen) return;
+                    StartDrawerSlide(startX, _workArea.Left, 240, true, gen);
+                }));
             }
-
-
-            _panelHost.CacheMode = new BitmapCache(1.0);   // 动画期间改用位图缓存，减少每帧重绘
-            _shift.BeginAnimation(TranslateTransform.XProperty, null);
-            _shift.X = -_panelW;
-            DoubleAnimation a = new DoubleAnimation(0, TimeSpan.FromMilliseconds(260));
-            a.EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut };
-            a.Completed += delegate { _busy = false; _panelHost.CacheMode = null; };
-            _shift.BeginAnimation(TranslateTransform.XProperty, a);
-            Fade(_overlay, 1, 260, 0);
+            else
+            {
+                StartDrawerSlide(startX, _workArea.Left, 240, true, gen);
+            }
         }
 
         private void RefreshGlass()
         {
             ApplyGlassStrength();
-            // 固定底色：不再截屏，也不再随模糊档变透明，彻底杜绝背景变化
+            // 固定极淡底色（叠加在原生 DWM 实时模糊或透明底之上，不截屏）
             _glass.Background = FixedBackdrop();
         }
 
         public void CloseDrawer()
         {
             if (!_open || _busy) return;
+            _busy = true;
+            int gen = ++_animGen;
+            _dragTile = null;
+            _dragItem = null;
+            _dragging = false;
+            if (_clockTimer != null) _clockTimer.Stop();
+            if (_topTimer != null) _topTimer.Stop();
+            if (_outsideTimer != null) _outsideTimer.Stop();
+            if (_homeScroller != null) _homeScroller.Stop();
+            if (_tagScroller != null) _tagScroller.Stop();
             CloseFolder();
             if (_music != null) _music.Hide();
-            _specWantShow = false;
             HideTagPanel();
-            DoubleAnimation a = new DoubleAnimation(-_panelW, TimeSpan.FromMilliseconds(250));
-            a.EasingFunction = new CubicEase { EasingMode = EasingMode.EaseIn };
-            a.Completed += delegate
-            {
-                _open = false;
-                ApplyClosedBounds();
-                UpdateClickCatcher();
-            };
-            _shift.BeginAnimation(TranslateTransform.XProperty, a);
-            Fade(_overlay, 0.1, 230, 0);
+
+            _panelHost.IsHitTestVisible = false;   // 收回动画期间禁用点击，避免误触
+            _panelHost.CacheMode = null;
+            StartFpsProbe("close");
+            StartDrawerSlide(_workArea.Left, _workArea.Left - _panelW - 24, 230, false, gen);
         }
 
         public void Toggle()
@@ -4104,6 +4773,138 @@ namespace SideDrawer
             }
         }
 
+        /// <summary>后台检测已失效的桌面快捷方式，只在确实发现缺失文件时才回到 UI 线程清理并重排。</summary>
+        private void PruneMissingItemsAsync()
+        {
+            if (Interlocked.Exchange(ref _pruneBusy, 1) != 0) return;
+            List<string> paths = new List<string>();
+            try
+            {
+                foreach (GroupDef g in _cfg.Groups)
+                    foreach (string p in g.Items) if (!string.IsNullOrEmpty(p)) paths.Add(p);
+                foreach (ItemCfg ic in _cfg.Pins)
+                    if (!string.IsNullOrEmpty(ic.Path)) paths.Add(ic.Path);
+                foreach (FolderDef f in _cfg.Folders)
+                    foreach (ItemCfg ic in f.Items) if (!string.IsNullOrEmpty(ic.Path)) paths.Add(ic.Path);
+            }
+            catch { Interlocked.Exchange(ref _pruneBusy, 0); return; }
+
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                bool anyMissing = false;
+                try
+                {
+                    for (int i = 0; i < paths.Count; i++)
+                    {
+                        string p = paths[i];
+                        if (!File.Exists(p) && !Directory.Exists(p)) { anyMissing = true; break; }
+                    }
+                }
+                catch { }
+                finally { Interlocked.Exchange(ref _pruneBusy, 0); }
+
+                if (!anyMissing) return;
+                try
+                {
+                    Dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(delegate
+                    {
+                        PruneMissingItems();
+                    }));
+                }
+                catch { }
+            });
+        }
+
+        /// <summary>清掉配置里指向已不存在文件的条目（用户在桌面上删了快捷方式），并重排补位。</summary>
+        private void PruneMissingItems()
+        {
+            try
+            {
+                bool changed = false;
+
+                foreach (GroupDef g in _cfg.Groups)
+                {
+                    for (int i = g.Items.Count - 1; i >= 0; i--)
+                    {
+                        string pth = g.Items[i];
+                        if (string.IsNullOrEmpty(pth)) { g.Items.RemoveAt(i); changed = true; continue; }
+                        if (!File.Exists(pth) && !Directory.Exists(pth)) { g.Items.RemoveAt(i); changed = true; Program.Log("prune missing: " + pth); }
+                    }
+                }
+
+                for (int i = _cfg.Pins.Count - 1; i >= 0; i--)
+                {
+                    string pth = _cfg.Pins[i].Path;
+                    if (string.IsNullOrEmpty(pth) || (!File.Exists(pth) && !Directory.Exists(pth))) { _cfg.Pins.RemoveAt(i); changed = true; }
+                }
+
+                foreach (FolderDef f in _cfg.Folders)
+                {
+                    for (int i = f.Items.Count - 1; i >= 0; i--)
+                    {
+                        string pth = f.Items[i].Path;
+                        if (string.IsNullOrEmpty(pth) || (!File.Exists(pth) && !Directory.Exists(pth))) { f.Items.RemoveAt(i); changed = true; }
+                    }
+                }
+
+                if (changed)
+                {
+                    ConfigStore.Save(_cfg);
+                    RebuildTiles();
+                }
+            }
+            catch (Exception ex) { Program.Log("prune failed: " + ex.Message); }
+        }
+
+
+
+        private void RemoveItemFromPanel(Item it, bool alsoDeleteFile)
+        {
+            if (it == null || string.IsNullOrEmpty(it.Path)) return;
+            try
+            {
+                if (alsoDeleteFile)
+                {
+                    string ext = IOPath.GetExtension(it.Path).ToLowerInvariant();
+                    if (ext == ".lnk" || ext == ".url" || ext == ".appref-ms")
+                    {
+                        MessageBoxResult r = MessageBox.Show(this,
+                            "确定删除快捷方式文件？\n" + it.Path + "\n\n只删除这个快捷方式，不会删除程序本体。",
+                            "删除快捷方式", MessageBoxButton.OKCancel, MessageBoxImage.Warning);
+                        if (r != MessageBoxResult.OK) return;
+                        try { File.Delete(it.Path); } catch { }
+                    }
+                }
+
+                // 1) 分类里移除
+                foreach (GroupDef g in _cfg.Groups)
+                {
+                    for (int i = g.Items.Count - 1; i >= 0; i--)
+                    {
+                        if (string.Equals(g.Items[i], it.Path, StringComparison.OrdinalIgnoreCase)) g.Items.RemoveAt(i);
+                    }
+                }
+                // 2) 置顶里移除
+                for (int i = _cfg.Pins.Count - 1; i >= 0; i--)
+                {
+                    if (string.Equals(_cfg.Pins[i].Path, it.Path, StringComparison.OrdinalIgnoreCase)) _cfg.Pins.RemoveAt(i);
+                }
+                // 3) 文件夹里移除
+                foreach (FolderDef f in _cfg.Folders)
+                {
+                    for (int i = f.Items.Count - 1; i >= 0; i--)
+                    {
+                        if (string.Equals(f.Items[i].Path, it.Path, StringComparison.OrdinalIgnoreCase)) f.Items.RemoveAt(i);
+                    }
+                }
+
+                ConfigStore.Save(_cfg);
+                Program.Log("removed from panel: " + it.Path + " deleteFile=" + alsoDeleteFile);
+                RebuildTiles();   // 重新排版，后面的图标自动补位
+            }
+            catch (Exception ex) { Program.Log("remove failed: " + ex.Message); }
+        }
+
         private void OpenItemMenu(Item it, FrameworkElement anchor)
         {
             ContextMenu cm = MakeMenu();
@@ -4129,6 +4930,20 @@ namespace SideDrawer
                 catch { }
             };
             cm.Items.Add(loc);
+
+            cm.Items.Add(new Separator());
+            MenuItem hideIt = new MenuItem();
+            hideIt.Header = "从面板移除（不删文件）";
+            hideIt.Click += delegate { RemoveItemFromPanel(it, false); };
+            cm.Items.Add(hideIt);
+
+            if (!it.IsFolder)
+            {
+                MenuItem delIt = new MenuItem();
+                delIt.Header = "删除快捷方式（连文件一起删）";
+                delIt.Click += delegate { RemoveItemFromPanel(it, true); };
+                cm.Items.Add(delIt);
+            }
 
             if (!it.IsFolder)
             {
@@ -4313,9 +5128,8 @@ namespace SideDrawer
                 if (_cfg.MusicPanel && _open)
                 {
                     Rect wam = _workArea;
-                    double mxm = Math.Max(0, ActualWidth - (MusicPanel.PW * MusicPanel.S) - 18);
-                    _music.SetPos(mxm, 26);
-                    _music.Show(mxm, 26, this);
+                    double mxm = Math.Max(0, wam.Left + wam.Width - (MusicPanel.PW * MusicPanel.S) - 18);
+                    _music.Show(mxm, wam.Top + 26, this);
                 }
                 else _music.Hide();
             };
@@ -4553,10 +5367,38 @@ namespace SideDrawer
             {
                 _cfg.CloseOnOutside = !_cfg.CloseOnOutside;
                 ConfigStore.Save(_cfg);
-                if (_clickCatcher != null && _open)
-            UpdateClickCatcher();
+                if (_open) UpdateClickCatcher();
                 ClosePanelMenu();
             }, _cfg.CloseOnOutside);
+
+            AddMenuItem(list, "主面板模糊玻璃（实时模糊）", delegate
+            {
+                _cfg.PanelBlur = !_cfg.PanelBlur;
+                ConfigStore.Save(_cfg);
+                ClosePanelMenu();
+                ApplyPanelBlur(false, true);
+            }, _cfg.PanelBlur);
+
+            AddMenuSeparator(list);
+            AddMenuSection(list, "边缘防误触（FPS 游戏）");
+            AddMenuItem(list, "智能防误触（推荐）", delegate
+            {
+                _cfg.EdgeGuard = 1;
+                ConfigStore.Save(_cfg);
+                ClosePanelMenu();
+            }, _cfg.EdgeGuard == 1);
+            AddMenuItem(list, "仅桌面触发（最严格）", delegate
+            {
+                _cfg.EdgeGuard = 2;
+                ConfigStore.Save(_cfg);
+                ClosePanelMenu();
+            }, _cfg.EdgeGuard == 2);
+            AddMenuItem(list, "关闭防误触（原版即时）", delegate
+            {
+                _cfg.EdgeGuard = 0;
+                ConfigStore.Save(_cfg);
+                ClosePanelMenu();
+            }, _cfg.EdgeGuard == 0);
             AddMenuSeparator(list);
             AddMenuSection(list, "收起按钮配色");
             AddMenuItem(list, "浅色（默认）", delegate
@@ -4586,9 +5428,8 @@ namespace SideDrawer
                 if (_music == null) return;
                 if (_cfg.MusicPanel && _open)
                 {
-                    double mxm = Math.Max(0, ActualWidth - (MusicPanel.PW * MusicPanel.S) - 18);
-                    _music.SetPos(mxm, 26);
-                    _music.Show(mxm, 26, this);
+                    double mxm = Math.Max(0, _workArea.Left + _workArea.Width - (MusicPanel.PW * MusicPanel.S) - 18);
+                    _music.Show(mxm, _workArea.Top + 26, this);
                 }
                 else _music.Hide();
             }, _cfg.MusicPanel);
@@ -4792,6 +5633,21 @@ namespace SideDrawer
                 catch { }
             }, false);
 
+            AddMenuSeparator(list);
+            if (!it.IsFolder)
+            {
+                AddMenuItem(list, "删除快捷方式（连文件一起删）", delegate
+                {
+                    ClosePanelMenu();
+                    RemoveItemFromPanel(it, true);
+                }, false);
+            }
+            AddMenuItem(list, "从面板移除（不删文件）", delegate
+            {
+                ClosePanelMenu();
+                RemoveItemFromPanel(it, false);
+            }, false);
+
             if (!it.IsFolder)
             {
                 AddMenuSeparator(list);
@@ -4845,14 +5701,15 @@ namespace SideDrawer
             gb.GradientStops.Add(new GradientStop(Color.FromArgb(0, 255, 168, 192), 0));
             gb.GradientStops.Add(new GradientStop(Color.FromArgb(58, 255, 168, 192), 0.5));
             gb.GradientStops.Add(new GradientStop(Color.FromArgb(0, 255, 168, 192), 1));
+            gb.Freeze();
             glow.Fill = gb;
             Canvas.SetTop(glow, 2);
             c.Children.Add(glow);
 
-            SolidColorBrush pink = new SolidColorBrush(Color.FromArgb(235, 255, 200, 220));
-            SolidColorBrush soft = new SolidColorBrush(Color.FromArgb(150, 255, 190, 210));
-            SolidColorBrush core = new SolidColorBrush(Color.FromArgb(245, 255, 246, 210));
-            SolidColorBrush dot = new SolidColorBrush(Color.FromArgb(170, 255, 220, 235));
+            SolidColorBrush pink = FreezeBrush(Color.FromArgb(235, 255, 200, 220));
+            SolidColorBrush soft = FreezeBrush(Color.FromArgb(150, 255, 190, 210));
+            SolidColorBrush core = FreezeBrush(Color.FromArgb(245, 255, 246, 210));
+            SolidColorBrush dot = FreezeBrush(Color.FromArgb(170, 255, 220, 235));
             // 樱花（大小不一）
             double[] xs = new double[] { 0.10, 0.30, 0.50, 0.70, 0.88 };
             double[] rs = new double[] { 5.5, 7.5, 9.0, 7.0, 5.0 };
@@ -5092,20 +5949,25 @@ namespace SideDrawer
         private void UpdateClock()
         {
             DateTime n = DateTime.Now;
-            _clock.Text = n.ToString("HH:mm");
+            string hm = n.ToString("HH:mm");
+            if (_clock.Text != hm) _clock.Text = hm;
             string[] wd = new string[] { "星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六" };
-            _date.Text = string.Format("{0}月{1}日   {2}", n.Month, n.Day, wd[(int)n.DayOfWeek]);
+            string dt = string.Format("{0}月{1}日   {2}", n.Month, n.Day, wd[(int)n.DayOfWeek]);
+            if (_date.Text != dt) _date.Text = dt;
         }
 
         // ------------------------------------------------------------ debug shot
         public void OpenInstant()
         {
+            if (_root == null) { ComputeWorkArea(); InitLayout(); }
             ApplyOpenBounds();
             UpdateLayout();
             RefreshGlass();
             if (Environment.GetEnvironmentVariable("SIDEDRAWER_NOGLASS") == "1")
                 _glass.Background = new SolidColorBrush(Color.FromArgb(255, 12, 12, 16));
-            _panelHost.CacheMode = new BitmapCache(1.0);   // 动画期间改用位图缓存，减少每帧重绘
+            _panelHost.CacheMode = null;
+            _panelHost.IsHitTestVisible = true;
+            _panelHost.Opacity = 1;
             _shift.BeginAnimation(TranslateTransform.XProperty, null);
             _shift.X = 0;
             _overlay.Opacity = 1;
@@ -5244,8 +6106,12 @@ namespace SideDrawer
         {
             base.OnSourceInitialized(e);
             IntPtr h = new WindowInteropHelper(this).Handle;
+            _hwnd = h;
             int ex = Native.GetWindowLong(h, Native.GWL_EXSTYLE);
             Native.SetWindowLong(h, Native.GWL_EXSTYLE, ex | Native.WS_EX_TOOLWINDOW | Native.WS_EX_NOACTIVATE);
+
+            DwmGlass.InitFrame(this, _cfg.PanelBlur, 0, 0, 0, 0);
+            RefreshDpi();
 
             HwndSource src = HwndSource.FromHwnd(h);
             if (src != null) src.AddHook(WndProc);
@@ -5262,11 +6128,15 @@ namespace SideDrawer
                     Point cpos = Mouse.GetPosition(_tagPanel);
                     if (cpos.X >= 0 && cpos.Y >= 0 && cpos.X <= _tagPanel.ActualWidth && cpos.Y <= _tagPanel.ActualHeight)
                     {
-                        int delta = (int)((long)wParam >> 16);
-                        double target = _tagScroll.VerticalOffset + (delta > 0 ? -60.0 : 60.0);
-                        if (target < 0) target = 0;
-                        if (target > _tagScroll.ScrollableHeight) target = _tagScroll.ScrollableHeight;
-                        _tagScroll.ScrollToVerticalOffset(target);
+                        int delta = (short)(((long)wParam >> 16) & 0xFFFF);
+                        if (_tagScroller != null) _tagScroller.ScrollByDelta(delta);
+                        else
+                        {
+                            double target = _tagScroll.VerticalOffset + (delta > 0 ? -60.0 : 60.0);
+                            if (target < 0) target = 0;
+                            if (target > _tagScroll.ScrollableHeight) target = _tagScroll.ScrollableHeight;
+                            _tagScroll.ScrollToVerticalOffset(target);
+                        }
                         handled = true;
                     }
                 }
@@ -5282,6 +6152,18 @@ namespace SideDrawer
 
         protected override void OnClosed(EventArgs e)
         {
+            StopDrawerSlide();
+            if (_clockTimer != null) _clockTimer.Stop();
+            if (_topTimer != null) _topTimer.Stop();
+            if (_outsideTimer != null) _outsideTimer.Stop();
+            if (_homeScroller != null) _homeScroller.Stop();
+            if (_tagScroller != null) _tagScroller.Stop();
+            StopFpsProbe();
+            DisposeGpuCounters();
+            try { if (_music != null) _music.Close(); } catch { }
+            try { if (_envWin != null) _envWin.Close(); } catch { }
+            try { if (_tagWin != null) _tagWin.Close(); } catch { }
+            try { if (_tab != null) _tab.Close(); } catch { }
             try { Native.UnregisterHotKey(new WindowInteropHelper(this).Handle, 1); }
             catch { }
             base.OnClosed(e);
@@ -5292,17 +6174,61 @@ namespace SideDrawer
     internal static class Program
     {
         public static readonly string LogPath = IOPath.Combine(AppDomain.CurrentDomain.BaseDirectory, "log.txt");
+        private static readonly object _logLock = new object();
+        private static readonly Queue<string> _logQueue = new Queue<string>();
+        private static int _logFlushing;
 
         public static void Log(string msg)
         {
-            try { File.AppendAllText(LogPath, DateTime.Now.ToString("HH:mm:ss.fff") + "  " + msg + Environment.NewLine, Encoding.UTF8); }
-            catch { }
+            string line = DateTime.Now.ToString("HH:mm:ss.fff") + "  " + msg + Environment.NewLine;
+            lock (_logLock)
+            {
+                if (_logQueue.Count < 512) _logQueue.Enqueue(line);
+            }
+            if (Interlocked.Exchange(ref _logFlushing, 1) == 0)
+            {
+                ThreadPool.QueueUserWorkItem(FlushLogs);
+            }
+        }
+
+        private static void FlushLogs(object state)
+        {
+            try
+            {
+                while (true)
+                {
+                    StringBuilder sb = new StringBuilder();
+                    lock (_logLock)
+                    {
+                        while (_logQueue.Count > 0) sb.Append(_logQueue.Dequeue());
+                        if (sb.Length == 0)
+                        {
+                            Interlocked.Exchange(ref _logFlushing, 0);
+                            return;
+                        }
+                    }
+                    try { File.AppendAllText(LogPath, sb.ToString(), new UTF8Encoding(false)); }
+                    catch { }
+                }
+            }
+            catch
+            {
+                Interlocked.Exchange(ref _logFlushing, 0);
+            }
         }
 
         [STAThread]
         private static void Main(string[] args)
         {
             try { ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12; } catch { }
+            try
+            {
+                int hz = Native.DisplayRefreshRate();
+                Timeline.DesiredFrameRateProperty.OverrideMetadata(
+                    typeof(Timeline),
+                    new FrameworkPropertyMetadata { DefaultValue = hz });
+            }
+            catch { }
 
             bool created;
             using (Mutex m = new Mutex(true, "SideDrawer.Local.SingleInstance", out created))

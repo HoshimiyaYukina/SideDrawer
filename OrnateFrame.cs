@@ -19,6 +19,7 @@ namespace SideDrawer
             c.IsHitTestVisible = false;
 
             SolidColorBrush stroke = new SolidColorBrush(Color.FromArgb((byte)(opacity * 255), line.R, line.G, line.B));
+            stroke.Freeze();
 
             // 内圈
             Border inner = new Border();
@@ -33,12 +34,14 @@ namespace SideDrawer
             c.Children.Add(inner);
 
             // 外圈（更淡）
+            SolidColorBrush outerStroke = new SolidColorBrush(Color.FromArgb((byte)(opacity * 90), line.R, line.G, line.B));
+            outerStroke.Freeze();
             Border outer = new Border();
             outer.Width = w - 14;
             outer.Height = h - 14;
             outer.CornerRadius = new CornerRadius(16);
             outer.BorderThickness = new Thickness(1);
-            outer.BorderBrush = new SolidColorBrush(Color.FromArgb((byte)(opacity * 90), line.R, line.G, line.B));
+            outer.BorderBrush = outerStroke;
             Canvas.SetLeft(outer, 7);
             Canvas.SetTop(outer, 7);
             c.Children.Add(outer);
@@ -51,13 +54,14 @@ namespace SideDrawer
             c.Children.Add(Sakura(d, h - d, r, stroke, 135));
             c.Children.Add(Sakura(w - d, h - d, r, stroke, 45));
 
-            // 线条投影：整层一次性加，避免每个元素单独开效果
+            // 线条投影：整层一次性加，冻结并交给外层 BitmapCache 缓存，避免每帧重算
             DropShadowEffect sh = new DropShadowEffect();
             sh.Color = Color.FromRgb(24, 6, 12);
             sh.BlurRadius = 5;
             sh.ShadowDepth = 1;
             sh.Direction = 270;
             sh.Opacity = 0.55;
+            sh.Freeze();
             c.Effect = sh;
 
             return c;
@@ -110,15 +114,20 @@ namespace SideDrawer
                 F(r * 0.95), F(-r * 0.72),
                 F(r * 0.50));
 
+            Geometry petalGeo = Geometry.Parse(petal);
+            if (petalGeo.CanFreeze) petalGeo.Freeze();
+
             for (int i = 0; i < 5; i++)
             {
                 Path p = new Path();
-                p.Data = Geometry.Parse(petal);
+                p.Data = petalGeo;
                 p.Stroke = stroke;
                 p.StrokeThickness = 1.3;
                 p.StrokeLineJoin = PenLineJoin.Round;
                 p.Fill = null;
-                p.RenderTransform = new RotateTransform(i * 72.0 + spin);
+                RotateTransform rt = new RotateTransform(i * 72.0 + spin);
+                rt.Freeze();
+                p.RenderTransform = rt;
                 Canvas.SetLeft(p, mid);
                 Canvas.SetTop(p, mid);
                 cc.Children.Add(p);
